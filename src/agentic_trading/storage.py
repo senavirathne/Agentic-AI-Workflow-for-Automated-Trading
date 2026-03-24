@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -56,6 +58,84 @@ class CloudObjectStorePlaceholder:
             "This project currently persists raw data locally and documents the "
             "S3/Azure Blob extension path."
         )
+
+
+@dataclass
+class AgentMemoryStore:
+    db_path: Path
+
+    def __post_init__(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path)
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_name TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    cycle_timestamp TEXT NOT NULL,
+                    memory_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def save_memory(self, agent_name: str, symbol: str, cycle_timestamp: str, memory: dict) -> None:
+        payload = dict(memory)
+        payload.setdefault("cycle_timestamp", cycle_timestamp)
+        payload.setdefault("symbol", symbol)
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_memories (
+                    agent_name, symbol, cycle_timestamp, memory_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_name,
+                    symbol,
+                    cycle_timestamp,
+                    json.dumps(payload, default=str),
+                    created_at,
+                ),
+            )
+
+    def load_latest_memory(self, agent_name: str, symbol: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT memory_json
+                FROM agent_memories
+                WHERE agent_name = ? AND symbol = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (agent_name, symbol),
+            ).fetchone()
+        if row is None:
+            return None
+        return _decode_memory_json(row[0])
+
+    def load_memory_window(self, agent_name: str, symbol: str, hours: int = 24) -> list[dict]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT memory_json
+                FROM agent_memories
+                WHERE agent_name = ? AND symbol = ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (agent_name, symbol, cutoff),
+            ).fetchall()
+        return [memory for row in rows if (memory := _decode_memory_json(row[0])) is not None]
 
 
 class SQLiteStructuredStore:
@@ -193,3 +273,10 @@ class SQLiteStructuredStore:
                     ),
                 )
 
+
+def _decode_memory_json(payload: str) -> dict | None:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

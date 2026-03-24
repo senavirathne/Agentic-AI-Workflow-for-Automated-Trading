@@ -17,7 +17,7 @@ from .agents import (
 from .alpaca_clients import AlpacaService
 from .config import Settings
 from .models import MarketContext, WorkflowResult
-from .storage import CloudObjectStorePlaceholder, LocalDataLake, SQLiteStructuredStore
+from .storage import AgentMemoryStore, CloudObjectStorePlaceholder, LocalDataLake, SQLiteStructuredStore
 from .utils import next_top_of_hour, sleep_until
 
 
@@ -27,6 +27,7 @@ class TradingWorkflow:
     service: AlpacaService = field(init=False)
     raw_lake: LocalDataLake | CloudObjectStorePlaceholder = field(init=False)
     structured_store: SQLiteStructuredStore = field(init=False)
+    memory_store: AgentMemoryStore = field(init=False)
     analysis_agent: MarketAnalysisAgent = field(init=False)
     retrieval_agent: InformationRetrievalAgent = field(init=False)
     risk_agent: RiskManagementAgent = field(init=False)
@@ -43,6 +44,7 @@ class TradingWorkflow:
             else LocalDataLake(self.settings.paths.raw_dir)
         )
         self.structured_store = SQLiteStructuredStore(self.settings.paths.database_path)
+        self.memory_store = AgentMemoryStore(self.settings.paths.database_path)
         self.llm_client = DeepSeekLLMClient(self.settings.llm) if self.settings.llm.enabled else None
         self.analysis_agent = MarketAnalysisAgent(self.settings.trading)
         self.retrieval_agent = InformationRetrievalAgent()
@@ -59,6 +61,10 @@ class TradingWorkflow:
 
     def run_once(self, symbol: str | None = None, execute_orders: bool = False) -> WorkflowResult:
         symbol = (symbol or self.settings.trading.primary_symbol).upper()
+        analysis_memory = self.memory_store.load_latest_memory("market_analysis", symbol)
+        retrieval_memory = self.memory_store.load_latest_memory("information_retrieval", symbol)
+        risk_memory = self.memory_store.load_latest_memory("risk_management", symbol)
+        decision_memory = self.memory_store.load_latest_memory("decision", symbol)
         trading = self.settings.trading
         short_timeframe = TimeFrame(
             amount=trading.short_timeframe_multiplier,
@@ -124,7 +130,56 @@ class TradingWorkflow:
             avg_entry_price=avg_entry_price,
             news=news,
         )
-        result = self.agent_graph.run(context, execute_orders=execute_orders)
+        result = self.agent_graph.run(
+            context,
+            execute_orders=execute_orders,
+            analysis_memory=analysis_memory,
+            retrieval_memory=retrieval_memory,
+            risk_memory=risk_memory,
+            decision_memory=decision_memory,
+        )
+        cycle_timestamp = result.analysis.latest_timestamp.isoformat()
+        self.memory_store.save_memory(
+            "market_analysis",
+            symbol,
+            cycle_timestamp,
+            self.analysis_agent.build_memory(result.analysis, analysis_memory, cycle_timestamp),
+        )
+        self.memory_store.save_memory(
+            "information_retrieval",
+            symbol,
+            cycle_timestamp,
+            self.retrieval_agent.build_memory(
+                result.retrieval,
+                retrieval_memory,
+                self.memory_store.load_memory_window("information_retrieval", symbol, hours=24),
+                cycle_timestamp,
+            ),
+        )
+        self.memory_store.save_memory(
+            "risk_management",
+            symbol,
+            cycle_timestamp,
+            self.risk_agent.build_memory(
+                result.context,
+                result.risk,
+                risk_memory,
+                self.memory_store.load_memory_window("risk_management", symbol, hours=24),
+                cycle_timestamp,
+            ),
+        )
+        self.memory_store.save_memory(
+            "decision",
+            symbol,
+            cycle_timestamp,
+            self.decision_agent.build_memory(
+                result.context,
+                result.decision,
+                decision_memory,
+                self.memory_store.load_memory_window("decision", symbol, hours=24),
+                cycle_timestamp,
+            ),
+        )
         self.structured_store.save_workflow_run(result)
         return result
 

@@ -10,9 +10,11 @@ class StubAnalysisAgent:
     def __init__(self, result: AnalysisResult, call_log: list[str]) -> None:
         self.result = result
         self.call_log = call_log
+        self.memory: dict | None = None
 
-    def analyze(self, context: MarketContext) -> AnalysisResult:
+    def analyze(self, context: MarketContext, memory: dict | None = None) -> AnalysisResult:
         self.call_log.append("analysis")
+        self.memory = memory
         return self.result
 
 
@@ -20,9 +22,11 @@ class StubRetrievalAgent:
     def __init__(self, result: RetrievalResult, call_log: list[str]) -> None:
         self.result = result
         self.call_log = call_log
+        self.memory: dict | None = None
 
-    def retrieve(self, symbol: str, articles: list[dict]) -> RetrievalResult:
+    def retrieve(self, symbol: str, articles: list[dict], memory: dict | None = None) -> RetrievalResult:
         self.call_log.append("retrieval")
+        self.memory = memory
         return self.result
 
 
@@ -30,9 +34,11 @@ class StubRiskAgent:
     def __init__(self, result: RiskPlan, call_log: list[str]) -> None:
         self.result = result
         self.call_log = call_log
+        self.memory: dict | None = None
 
-    def evaluate(self, context: MarketContext) -> RiskPlan:
+    def evaluate(self, context: MarketContext, memory: dict | None = None) -> RiskPlan:
         self.call_log.append("risk")
+        self.memory = memory
         return self.result
 
 
@@ -40,6 +46,7 @@ class StubDecisionAgent:
     def __init__(self, result: Decision, call_log: list[str]) -> None:
         self.result = result
         self.call_log = call_log
+        self.memory: dict | None = None
 
     def decide(
         self,
@@ -47,8 +54,10 @@ class StubDecisionAgent:
         analysis: AnalysisResult,
         retrieval: RetrievalResult,
         risk: RiskPlan,
+        memory: dict | None = None,
     ) -> Decision:
         self.call_log.append("decision")
+        self.memory = memory
         return self.result
 
 
@@ -174,6 +183,43 @@ def test_trading_agent_graph_skips_execution_when_order_submission_is_disabled()
     assert call_log == ["analysis", "retrieval", "risk", "decision"]
 
 
+def test_trading_agent_graph_passes_loaded_memories_into_agents() -> None:
+    call_log: list[str] = []
+    analysis_agent = StubAnalysisAgent(_make_analysis(), call_log)
+    retrieval_agent = StubRetrievalAgent(_make_retrieval(), call_log)
+    risk_agent = StubRiskAgent(_make_risk(), call_log)
+    decision_agent = StubDecisionAgent(
+        Decision(
+            symbol="TQQQ",
+            action=Action.HOLD,
+            quantity=0,
+            confidence=0.5,
+            rationale=["No setup."],
+        ),
+        call_log,
+    )
+    graph = TradingAgentGraph(
+        analysis_agent=analysis_agent,
+        retrieval_agent=retrieval_agent,
+        risk_agent=risk_agent,
+        decision_agent=decision_agent,
+        execution_agent=StubExecutionAgent("order-123", call_log),
+    )
+
+    graph.run(
+        _make_context(),
+        analysis_memory={"rsi": 40.0},
+        retrieval_memory={"positive_hits": 2},
+        risk_memory={"buying_power": 9_000.0},
+        decision_memory={"consecutive_holds": 3},
+    )
+
+    assert analysis_agent.memory == {"rsi": 40.0}
+    assert retrieval_agent.memory == {"positive_hits": 2}
+    assert risk_agent.memory == {"buying_power": 9_000.0}
+    assert decision_agent.memory == {"consecutive_holds": 3}
+
+
 def test_information_retrieval_agent_collects_structured_news_inputs() -> None:
     agent = InformationRetrievalAgent(max_news_items=5)
 
@@ -235,3 +281,31 @@ def test_decision_agent_does_not_allow_llm_to_invent_new_buy_signal() -> None:
     assert result.action == Action.HOLD
     assert result.quantity == 0
     assert result.metadata["decision_source"] == "rules_with_llm_review"
+
+
+def test_decision_agent_includes_memory_context_in_llm_prompt() -> None:
+    llm_client = StubLLMClient(
+        '{"action": "HOLD", "quantity": 0, "confidence": 0.50, "rationale": ["Stay patient."]}'
+    )
+    agent = DecisionAgent(llm_client=llm_client)
+
+    agent.decide(
+        _make_context(),
+        _make_analysis(),
+        _make_retrieval(),
+        _make_risk(),
+        memory={
+            "consecutive_holds": 2,
+            "avg_confidence_24h": 0.62,
+            "win_rate_recent": 0.67,
+            "last_buy_timestamp": "2025-01-01T12:00:00+00:00",
+            "last_sell_timestamp": "2025-01-01T14:00:00+00:00",
+            "decisions_24h": {"BUY": 1, "SELL": 1, "HOLD": 6},
+        },
+    )
+
+    assert llm_client.calls
+    _, prompt = llm_client.calls[0]
+    assert "Previous average confidence (24h): 0.62" in prompt
+    assert "Previous recent win rate: 0.67" in prompt
+    assert "Previous decisions_24h: {'BUY': 1, 'SELL': 1, 'HOLD': 6}" in prompt

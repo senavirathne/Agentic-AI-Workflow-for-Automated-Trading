@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import logging
 from dataclasses import dataclass, field
@@ -107,7 +108,7 @@ class DeepSeekLLMClient:
 class MarketAnalysisAgent:
     config: TradingConfig
 
-    def analyze(self, context: MarketContext) -> AnalysisResult:
+    def analyze(self, context: MarketContext, memory: dict | None = None) -> AnalysisResult:
         signal_frame = generate_signal_frame(
             context.short_bars,
             context.medium_bars,
@@ -124,6 +125,28 @@ class MarketAnalysisAgent:
             notes.append("Intermediate 2-hour trend confirmation is bullish.")
         if bool(latest["in_uptrend"]):
             notes.append("Trend filter is bullish on the daily timeframe.")
+        if memory is not None:
+            rsi_trend = _trend_direction(float(latest["rsi"]), memory.get("rsi"))
+            if rsi_trend == "rising":
+                notes.append("RSI is rising versus the previous cycle.")
+            elif rsi_trend == "falling":
+                notes.append("RSI is falling versus the previous cycle.")
+
+            macd_trend = _macd_trend(
+                current_macd=float(latest["macd"]),
+                current_signal=float(latest["macd_signal"]),
+                previous_macd=memory.get("macd"),
+                previous_signal=memory.get("macd_signal"),
+            )
+            if macd_trend == "converging":
+                notes.append("MACD is converging toward the signal line versus the previous cycle.")
+            elif macd_trend == "diverging":
+                notes.append("MACD is diverging from the signal line versus the previous cycle.")
+
+            if bool(latest["in_uptrend"]):
+                streak = _next_true_streak(bool(latest["in_uptrend"]), memory, "consecutive_uptrend_hours")
+                if streak > 1:
+                    notes.append(f"Daily uptrend has held for {streak} consecutive cycles.")
 
         return AnalysisResult(
             symbol=context.symbol,
@@ -141,12 +164,44 @@ class MarketAnalysisAgent:
             notes=notes,
         )
 
+    def build_memory(
+        self,
+        analysis: AnalysisResult,
+        previous_memory: dict | None,
+        cycle_timestamp: str,
+    ) -> dict[str, Any]:
+        latest = analysis.signal_frame.iloc[-1]
+        in_uptrend = bool(analysis.in_uptrend)
+        return {
+            "cycle_timestamp": cycle_timestamp,
+            "symbol": analysis.symbol,
+            "rsi": analysis.rsi_now,
+            "macd": analysis.macd_now,
+            "macd_signal": analysis.signal_now,
+            "in_uptrend": in_uptrend,
+            "medium_trend_bullish": bool(latest["medium_trend_bullish"]),
+            "entry_setup": analysis.entry_setup,
+            "exit_setup": analysis.exit_setup,
+            "ma_fast": analysis.ma_fast,
+            "ma_mid": analysis.ma_mid,
+            "ma_slow": analysis.ma_slow,
+            "notes": list(analysis.notes),
+            "rsi_trend": _trend_direction(analysis.rsi_now, None if previous_memory is None else previous_memory.get("rsi")),
+            "macd_trend": _macd_trend(
+                current_macd=analysis.macd_now,
+                current_signal=analysis.signal_now,
+                previous_macd=None if previous_memory is None else previous_memory.get("macd"),
+                previous_signal=None if previous_memory is None else previous_memory.get("macd_signal"),
+            ),
+            "consecutive_uptrend_hours": _next_true_streak(in_uptrend, previous_memory, "consecutive_uptrend_hours"),
+        }
+
 
 @dataclass
 class InformationRetrievalAgent:
     max_news_items: int = 5
 
-    def retrieve(self, symbol: str, articles: list[dict]) -> RetrievalResult:
+    def retrieve(self, symbol: str, articles: list[dict], memory: dict | None = None) -> RetrievalResult:
         positive_hits = 0
         negative_hits = 0
         risk_flags: list[str] = []
@@ -175,15 +230,58 @@ class InformationRetrievalAgent:
             risk_flags=risk_flags,
         )
 
+    def build_memory(
+        self,
+        retrieval: RetrievalResult,
+        previous_memory: dict | None,
+        recent_memories: list[dict] | None,
+        cycle_timestamp: str,
+    ) -> dict[str, Any]:
+        recent_memories = recent_memories or []
+        current_net = retrieval.positive_hits - retrieval.negative_hits
+        recent_nets = [
+            int(memory.get("positive_hits", 0)) - int(memory.get("negative_hits", 0))
+            for memory in recent_memories[-3:]
+        ]
+        average_recent_net = (sum(recent_nets) / len(recent_nets)) if recent_nets else current_net
+        if current_net > average_recent_net:
+            sentiment_trend = "improving"
+        elif current_net < average_recent_net:
+            sentiment_trend = "worsening"
+        else:
+            sentiment_trend = "stable"
+
+        return {
+            "cycle_timestamp": cycle_timestamp,
+            "symbol": retrieval.symbol,
+            "positive_hits": retrieval.positive_hits,
+            "negative_hits": retrieval.negative_hits,
+            "risk_flags": list(retrieval.risk_flags),
+            "top_headlines": retrieval.headline_summary[: self.max_news_items],
+            "sentiment_trend": sentiment_trend,
+            "cumulative_positive_24h": sum(int(memory.get("positive_hits", 0)) for memory in recent_memories)
+            + retrieval.positive_hits,
+            "cumulative_negative_24h": sum(int(memory.get("negative_hits", 0)) for memory in recent_memories)
+            + retrieval.negative_hits,
+            "persistent_risk_flags": _persistent_flags(retrieval.risk_flags, recent_memories),
+        }
+
 
 @dataclass
 class RiskManagementAgent:
     config: TradingConfig
 
-    def evaluate(self, context: MarketContext) -> RiskPlan:
+    def evaluate(self, context: MarketContext, memory: dict | None = None) -> RiskPlan:
         notes = []
         max_notional = context.buying_power * self.config.buy_power_limit
         recommended_qty = int(max_notional / context.latest_price) if context.latest_price > 0 else 0
+
+        if memory is not None:
+            buying_power_trend = _trend_direction(context.buying_power, memory.get("buying_power"))
+            if buying_power_trend == "rising":
+                notes.append("Buying power increased versus the previous cycle.")
+            elif buying_power_trend == "falling":
+                notes.append("Buying power decreased versus the previous cycle.")
 
         if not context.market_open:
             notes.append("Market is closed, so no new entry can be opened.")
@@ -198,6 +296,53 @@ class RiskManagementAgent:
             notes=notes,
         )
 
+    def build_memory(
+        self,
+        context: MarketContext,
+        risk: RiskPlan,
+        previous_memory: dict | None,
+        recent_memories: list[dict] | None,
+        cycle_timestamp: str,
+    ) -> dict[str, Any]:
+        recent_memories = recent_memories or []
+        if context.position_open:
+            open_position_since = (
+                (
+                    previous_memory.get("open_position_since")
+                    or previous_memory.get("cycle_timestamp")
+                    or cycle_timestamp
+                )
+                if previous_memory is not None and bool(previous_memory.get("position_open"))
+                else cycle_timestamp
+            )
+        else:
+            open_position_since = None
+
+        return {
+            "cycle_timestamp": cycle_timestamp,
+            "symbol": risk.symbol,
+            "max_notional": risk.max_notional,
+            "recommended_qty": risk.recommended_qty,
+            "can_enter": risk.can_enter,
+            "buying_power": context.buying_power,
+            "latest_price": context.latest_price,
+            "buying_power_trend": _trend_direction(
+                context.buying_power,
+                None if previous_memory is None else previous_memory.get("buying_power"),
+            ),
+            "position_changes_24h": _count_position_changes(recent_memories, context.position_open),
+            "avg_holding_period_hours": _average_holding_period_hours(
+                recent_memories,
+                {
+                    "cycle_timestamp": cycle_timestamp,
+                    "position_open": context.position_open,
+                    "open_position_since": open_position_since,
+                },
+            ),
+            "position_open": context.position_open,
+            "open_position_since": open_position_since,
+        }
+
 
 @dataclass
 class DecisionAgent:
@@ -209,9 +354,17 @@ class DecisionAgent:
         analysis: AnalysisResult,
         retrieval: RetrievalResult,
         risk: RiskPlan,
+        memory: dict | None = None,
     ) -> Decision:
         rule_based_decision = self._rule_based_decision(context, analysis, retrieval, risk)
-        reviewed_decision = self._review_with_llm(context, analysis, retrieval, risk, rule_based_decision)
+        reviewed_decision = self._review_with_llm(
+            context,
+            analysis,
+            retrieval,
+            risk,
+            rule_based_decision,
+            memory=memory,
+        )
         return reviewed_decision or rule_based_decision
 
     def _rule_based_decision(
@@ -292,9 +445,23 @@ class DecisionAgent:
         retrieval: RetrievalResult,
         risk: RiskPlan,
         rule_based_decision: Decision,
+        memory: dict | None = None,
     ) -> Decision | None:
         if self.llm_client is None:
             return None
+
+        memory_lines: list[str] = []
+        if memory is not None:
+            memory_lines.extend(
+                [
+                    f"Previous decision memory: consecutive_holds={_coerce_int(memory.get('consecutive_holds'), 0)}",
+                    f"Previous average confidence (24h): {(_as_float(memory.get('avg_confidence_24h')) or 0.0):.2f}",
+                    f"Previous recent win rate: {(_as_float(memory.get('win_rate_recent')) or 0.0):.2f}",
+                    f"Previous last buy timestamp: {memory.get('last_buy_timestamp')}",
+                    f"Previous last sell timestamp: {memory.get('last_sell_timestamp')}",
+                    f"Previous decisions_24h: {memory.get('decisions_24h', {})}",
+                ]
+            )
 
         raw = self.llm_client.generate(
             TRADING_SYSTEM_PROMPT,
@@ -316,6 +483,7 @@ class DecisionAgent:
                     f"Rule-based action: {rule_based_decision.action.value}",
                     f"Rule-based quantity: {rule_based_decision.quantity}",
                     f"Rule-based confidence: {rule_based_decision.confidence:.2f}",
+                    *memory_lines,
                     "Return JSON only.",
                 ]
             ),
@@ -382,6 +550,43 @@ class DecisionAgent:
             metadata={**metadata, "decision_source": "rules_with_llm_review"},
         )
 
+    def build_memory(
+        self,
+        context: MarketContext,
+        decision: Decision,
+        previous_memory: dict | None,
+        recent_memories: list[dict] | None,
+        cycle_timestamp: str,
+    ) -> dict[str, Any]:
+        recent_memories = recent_memories or []
+        current_entry = {
+            "cycle_timestamp": cycle_timestamp,
+            "action": decision.action.value,
+            "confidence": decision.confidence,
+            "latest_price": context.latest_price,
+        }
+        decision_counts = _decision_counts(recent_memories, decision.action.value)
+        return {
+            "cycle_timestamp": cycle_timestamp,
+            "symbol": decision.symbol,
+            "action": decision.action.value,
+            "quantity": decision.quantity,
+            "confidence": decision.confidence,
+            "decision_source": str(decision.metadata.get("decision_source", "rules")),
+            "rationale_summary": _rationale_summary(decision.rationale),
+            "last_buy_timestamp": cycle_timestamp
+            if decision.action == Action.BUY
+            else (None if previous_memory is None else previous_memory.get("last_buy_timestamp")),
+            "last_sell_timestamp": cycle_timestamp
+            if decision.action == Action.SELL
+            else (None if previous_memory is None else previous_memory.get("last_sell_timestamp")),
+            "consecutive_holds": _next_hold_streak(decision.action, previous_memory),
+            "decisions_24h": decision_counts,
+            "avg_confidence_24h": _average_confidence(recent_memories, decision.confidence),
+            "win_rate_recent": _recent_win_rate(recent_memories + [current_entry]),
+            "latest_price": context.latest_price,
+        }
+
 
 @dataclass
 class ExecutionAgent:
@@ -410,6 +615,10 @@ class TradingAgentState(TypedDict, total=False):
     risk: RiskPlan
     decision: Decision
     order_id: str | None
+    analysis_memory: dict | None
+    retrieval_memory: dict | None
+    risk_memory: dict | None
+    decision_memory: dict | None
 
 
 @dataclass
@@ -425,8 +634,23 @@ class TradingAgentGraph:
         if StateGraph is not None:
             self._app = self._build_graph()
 
-    def run(self, context: MarketContext, execute_orders: bool = False) -> WorkflowResult:
-        initial_state: TradingAgentState = {"context": context, "execute_orders": execute_orders}
+    def run(
+        self,
+        context: MarketContext,
+        execute_orders: bool = False,
+        analysis_memory: dict | None = None,
+        retrieval_memory: dict | None = None,
+        risk_memory: dict | None = None,
+        decision_memory: dict | None = None,
+    ) -> WorkflowResult:
+        initial_state: TradingAgentState = {
+            "context": context,
+            "execute_orders": execute_orders,
+            "analysis_memory": analysis_memory,
+            "retrieval_memory": retrieval_memory,
+            "risk_memory": risk_memory,
+            "decision_memory": decision_memory,
+        }
         state = self._app.invoke(initial_state) if self._app is not None else self._run_sequential(initial_state)
         return WorkflowResult(
             context=context,
@@ -469,14 +693,30 @@ class TradingAgentGraph:
         return state
 
     def _analyze_market(self, state: TradingAgentState) -> dict[str, AnalysisResult]:
-        return {"analysis": self.analysis_agent.analyze(state["context"])}
+        return {
+            "analysis": self.analysis_agent.analyze(
+                state["context"],
+                memory=state.get("analysis_memory"),
+            )
+        }
 
     def _retrieve_information(self, state: TradingAgentState) -> dict[str, RetrievalResult]:
         context = state["context"]
-        return {"retrieval": self.retrieval_agent.retrieve(context.symbol, context.news)}
+        return {
+            "retrieval": self.retrieval_agent.retrieve(
+                context.symbol,
+                context.news,
+                memory=state.get("retrieval_memory"),
+            )
+        }
 
     def _evaluate_risk(self, state: TradingAgentState) -> dict[str, RiskPlan]:
-        return {"risk": self.risk_agent.evaluate(state["context"])}
+        return {
+            "risk": self.risk_agent.evaluate(
+                state["context"],
+                memory=state.get("risk_memory"),
+            )
+        }
 
     def _make_decision(self, state: TradingAgentState) -> dict[str, Decision]:
         return {
@@ -485,6 +725,7 @@ class TradingAgentGraph:
                 state["analysis"],
                 state["retrieval"],
                 state["risk"],
+                memory=state.get("decision_memory"),
             )
         }
 
@@ -565,3 +806,168 @@ def _coerce_confidence(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, parsed))
+
+
+def _trend_direction(current: Any, previous: Any) -> str:
+    current_value = _as_float(current)
+    previous_value = _as_float(previous)
+    if current_value is None or previous_value is None:
+        return "stable"
+    if current_value > previous_value:
+        return "rising"
+    if current_value < previous_value:
+        return "falling"
+    return "stable"
+
+
+def _macd_trend(
+    current_macd: Any,
+    current_signal: Any,
+    previous_macd: Any,
+    previous_signal: Any,
+) -> str:
+    current_macd_value = _as_float(current_macd)
+    current_signal_value = _as_float(current_signal)
+    previous_macd_value = _as_float(previous_macd)
+    previous_signal_value = _as_float(previous_signal)
+    if None in {
+        current_macd_value,
+        current_signal_value,
+        previous_macd_value,
+        previous_signal_value,
+    }:
+        return "stable"
+
+    current_gap = abs(current_macd_value - current_signal_value)
+    previous_gap = abs(previous_macd_value - previous_signal_value)
+    if current_gap < previous_gap:
+        return "converging"
+    if current_gap > previous_gap:
+        return "diverging"
+    return "stable"
+
+
+def _next_true_streak(current_value: bool, previous_memory: dict | None, key: str) -> int:
+    if not current_value:
+        return 0
+    previous_streak = 0 if previous_memory is None else int(previous_memory.get(key, 0))
+    if previous_memory is not None and bool(previous_memory.get("in_uptrend")):
+        return previous_streak + 1
+    return 1
+
+
+def _persistent_flags(current_flags: list[str], recent_memories: list[dict]) -> list[str]:
+    persistent: list[str] = []
+    for flag in current_flags:
+        streak = 1
+        for memory in reversed(recent_memories):
+            if flag not in _as_string_list(memory.get("risk_flags")):
+                break
+            streak += 1
+        if streak >= 2:
+            persistent.append(flag)
+    return persistent
+
+
+def _count_position_changes(recent_memories: list[dict], current_position_open: bool) -> int:
+    states: list[bool] = [
+        bool(memory.get("position_open"))
+        for memory in recent_memories
+        if "position_open" in memory
+    ]
+    states.append(current_position_open)
+    return sum(previous != current for previous, current in zip(states, states[1:]))
+
+
+def _average_holding_period_hours(recent_memories: list[dict], current_snapshot: dict[str, Any]) -> float:
+    snapshots = [*recent_memories, current_snapshot]
+    durations: list[float] = []
+    open_since: datetime | None = None
+
+    for snapshot in snapshots:
+        timestamp = _parse_cycle_timestamp(snapshot.get("cycle_timestamp"))
+        if timestamp is None:
+            continue
+
+        if bool(snapshot.get("position_open")):
+            if open_since is None:
+                open_since = _parse_cycle_timestamp(snapshot.get("open_position_since")) or timestamp
+            continue
+
+        if open_since is not None:
+            durations.append((timestamp - open_since).total_seconds() / 3600)
+            open_since = None
+
+    if not durations:
+        return 0.0
+    return round(sum(durations) / len(durations), 2)
+
+
+def _next_hold_streak(action: Action, previous_memory: dict | None) -> int:
+    if action != Action.HOLD:
+        return 0
+    previous_holds = 0 if previous_memory is None else int(previous_memory.get("consecutive_holds", 0))
+    return previous_holds + 1
+
+
+def _decision_counts(recent_memories: list[dict], current_action: str) -> dict[str, int]:
+    counts = {action.value: 0 for action in Action}
+    for memory in recent_memories:
+        action = str(memory.get("action", "")).upper()
+        if action in counts:
+            counts[action] += 1
+    counts[current_action] += 1
+    return counts
+
+
+def _average_confidence(recent_memories: list[dict], current_confidence: float) -> float:
+    confidences = [
+        value
+        for memory in recent_memories
+        if (value := _as_float(memory.get("confidence"))) is not None
+    ]
+    confidences.append(current_confidence)
+    return round(sum(confidences) / len(confidences), 2) if confidences else 0.0
+
+
+def _recent_win_rate(recent_memories: list[dict]) -> float:
+    entry_price: float | None = None
+    outcomes: list[bool] = []
+
+    for memory in recent_memories:
+        action = str(memory.get("action", "")).upper()
+        latest_price = _as_float(memory.get("latest_price"))
+        if latest_price is None:
+            continue
+        if action == Action.BUY.value:
+            entry_price = latest_price
+        elif action == Action.SELL.value and entry_price is not None:
+            outcomes.append(latest_price > entry_price)
+            entry_price = None
+
+    if not outcomes:
+        return 0.0
+    return round(sum(outcomes) / len(outcomes), 2)
+
+
+def _rationale_summary(rationale: list[str]) -> str:
+    if not rationale:
+        return ""
+    return rationale[0]
+
+
+def _parse_cycle_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

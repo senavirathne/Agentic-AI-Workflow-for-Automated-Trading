@@ -68,21 +68,22 @@ def _collect(args: argparse.Namespace, settings: Settings) -> None:
     workflow = TradingWorkflow(settings)
     trading = settings.trading
     symbols = [symbol.upper() for symbol in (args.symbols or settings.trading.universe_symbols)]
+    lookback_override = args.days
     timeframe_requests = [
         (
             trading.short_timeframe,
             trading.short_timeframe_multiplier,
-            _resolve_lookback_days(args.days, trading.short_lookback_days),
+            lookback_override if lookback_override is not None else trading.short_lookback_days,
         ),
         (
             trading.medium_timeframe,
             trading.medium_timeframe_multiplier,
-            _resolve_lookback_days(args.days, trading.medium_lookback_days),
+            lookback_override if lookback_override is not None else trading.medium_lookback_days,
         ),
         (
             trading.long_timeframe,
             1,
-            _resolve_lookback_days(args.days, trading.long_lookback_days),
+            lookback_override if lookback_override is not None else trading.long_lookback_days,
         ),
     ]
 
@@ -110,7 +111,11 @@ def _collect(args: argparse.Namespace, settings: Settings) -> None:
 def _run_eda(args: argparse.Namespace, settings: Settings) -> None:
     service = AlpacaService(settings)
     symbols = [symbol.upper() for symbol in (args.symbols or settings.trading.universe_symbols)]
-    bars_by_symbol = service.fetch_stock_bars(symbols, TimeFrameUnit.Day, args.days)
+    bars_by_symbol = service.fetch_stock_bars(
+        symbols,
+        TimeFrame(amount=1, unit=TimeFrameUnit.Day),
+        args.days,
+    )
     output_dir = settings.paths.reports_dir / "eda"
     artifacts = generate_eda_artifacts(bars_by_symbol, output_dir, settings.trading)
     print(f"EDA outputs written to {artifacts['summary']}")
@@ -168,10 +173,6 @@ def _configure_logging(log_path: Path) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-
-def _resolve_lookback_days(override_days: int | None, default_days: int) -> int:
-    return override_days if override_days is not None else default_days
 
 
 def _timeframe_storage_key(timeframe_unit: TimeFrameUnit, multiplier: int = 1) -> str:

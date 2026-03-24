@@ -7,7 +7,7 @@ from typing import Any
 from alpaca.data.historical import NewsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient, StockLatestTradeRequest
 from alpaca.data.requests import NewsRequest, StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
@@ -49,22 +49,13 @@ class AlpacaService:
     def fetch_stock_bars(
         self,
         symbols: list[str],
-        timeframe: TimeFrame | TimeFrameUnit,
+        timeframe: TimeFrame,
         days: int,
-        timeframe_multiplier: int = 1,
     ) -> dict[str, Any]:
         today = datetime.now(timezone.utc)
-        if timeframe_multiplier <= 0:
-            raise ValueError("timeframe_multiplier must be a positive integer")
-
-        resolved_timeframe = (
-            TimeFrame(amount=timeframe_multiplier, unit=timeframe)
-            if isinstance(timeframe, TimeFrameUnit)
-            else timeframe
-        )
         request = StockBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=resolved_timeframe,
+            timeframe=timeframe,
             start=today - timedelta(days=days),
         )
         frame = self.stock_data_client.get_stock_bars(request).df
