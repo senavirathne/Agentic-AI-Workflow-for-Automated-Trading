@@ -47,12 +47,24 @@ class AlpacaService:
         )
 
     def fetch_stock_bars(
-        self, symbols: list[str], timeframe_unit: TimeFrameUnit, days: int
+        self,
+        symbols: list[str],
+        timeframe: TimeFrame | TimeFrameUnit,
+        days: int,
+        timeframe_multiplier: int = 1,
     ) -> dict[str, Any]:
         today = datetime.now(timezone.utc)
+        if timeframe_multiplier <= 0:
+            raise ValueError("timeframe_multiplier must be a positive integer")
+
+        resolved_timeframe = (
+            TimeFrame(amount=timeframe_multiplier, unit=timeframe)
+            if isinstance(timeframe, TimeFrameUnit)
+            else timeframe
+        )
         request = StockBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=TimeFrame(amount=1, unit=timeframe_unit),
+            timeframe=resolved_timeframe,
             start=today - timedelta(days=days),
         )
         frame = self.stock_data_client.get_stock_bars(request).df
@@ -115,4 +127,3 @@ class AlpacaService:
             time_in_force=TimeInForce.DAY,
         )
         return self.trading_client.submit_order(request)
-

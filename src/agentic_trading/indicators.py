@@ -43,10 +43,23 @@ def add_features(frame: pd.DataFrame, config: TradingConfig) -> pd.DataFrame:
     return features
 
 
-def build_trend_context(
-    main_index: pd.Index, trend_frame: pd.DataFrame, config: TradingConfig
+def build_medium_context(
+    short_index: pd.Index, medium_frame: pd.DataFrame, config: TradingConfig
 ) -> pd.DataFrame:
-    trend_features = add_features(trend_frame, config)
+    medium_features = add_features(medium_frame.sort_index(), config)
+    medium_view = medium_features[["ma_fast", "ma_mid"]].rename(
+        columns={
+            "ma_fast": "medium_ma_fast",
+            "ma_mid": "medium_ma_mid",
+        }
+    )
+    return medium_view.reindex(short_index, method="ffill")
+
+
+def build_trend_context(
+    short_index: pd.Index, long_frame: pd.DataFrame, config: TradingConfig
+) -> pd.DataFrame:
+    trend_features = add_features(long_frame.sort_index(), config)
     trend_view = trend_features[["ma_fast", "ma_mid", "ma_slow"]].rename(
         columns={
             "ma_fast": "trend_ma_fast",
@@ -54,7 +67,7 @@ def build_trend_context(
             "ma_slow": "trend_ma_slow",
         }
     )
-    return trend_view.reindex(main_index, method="ffill")
+    return trend_view.reindex(short_index, method="ffill")
 
 
 @dataclass
@@ -119,11 +132,16 @@ class WindowSignalTracker:
 
 
 def generate_signal_frame(
-    main_frame: pd.DataFrame, trend_frame: pd.DataFrame, config: TradingConfig
+    short_frame: pd.DataFrame,
+    medium_frame: pd.DataFrame,
+    long_frame: pd.DataFrame,
+    config: TradingConfig,
 ) -> pd.DataFrame:
-    features = add_features(main_frame, config)
-    trend_context = build_trend_context(features.index, trend_frame, config)
-    features = features.join(trend_context)
+    features = add_features(short_frame.sort_index(), config)
+    medium_context = build_medium_context(features.index, medium_frame, config)
+    trend_context = build_trend_context(features.index, long_frame, config)
+    features = features.join(medium_context).join(trend_context)
+    features["medium_trend_bullish"] = features["medium_ma_fast"] > features["medium_ma_mid"]
     features["in_uptrend"] = (
         (features["trend_ma_fast"] > features["trend_ma_mid"])
         & (features["trend_ma_mid"] > features["trend_ma_slow"])
@@ -157,12 +175,12 @@ def generate_signal_frame(
             sig_now=float(current["macd_signal"]),
         )
 
-        if buy_signal and bool(current["in_uptrend"]):
-            features.iloc[index, features.columns.get_loc("buy_signal")] = True
+        timestamp = features.index[index]
+        if buy_signal and bool(current["medium_trend_bullish"]) and bool(current["in_uptrend"]):
+            features.at[timestamp, "buy_signal"] = True
         if sell_signal:
-            features.iloc[index, features.columns.get_loc("sell_signal")] = True
+            features.at[timestamp, "sell_signal"] = True
 
     features.loc[features["buy_signal"], "signal"] = "BUY"
     features.loc[features["sell_signal"], "signal"] = "SELL"
     return features
-

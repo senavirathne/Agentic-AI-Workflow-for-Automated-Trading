@@ -21,8 +21,12 @@ def test_backtester_generates_closed_trade(monkeypatch) -> None:
         index=pd.date_range("2025-01-01", periods=4, freq="h", tz="UTC"),
     )
 
-    monkeypatch.setattr(backtester, "prepare_signal_frame", lambda main, trend: signal_frame)
-    summary = backtester.backtest("TQQQ", signal_frame, signal_frame)
+    monkeypatch.setattr(
+        backtester,
+        "prepare_signal_frame",
+        lambda short, medium, long: signal_frame,
+    )
+    summary = backtester.backtest("TQQQ", signal_frame, signal_frame, signal_frame)
 
     assert summary.trade_count == 1
     assert len(summary.trades) == 1

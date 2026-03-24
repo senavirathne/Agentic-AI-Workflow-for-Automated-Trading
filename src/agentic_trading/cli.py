@@ -4,7 +4,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from alpaca.data.timeframe import TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from .alpaca_clients import AlpacaService
 from .analysis import generate_eda_artifacts
@@ -19,7 +19,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect", help="Collect raw market data and news.")
     collect.add_argument("--symbols", nargs="+", help="Symbols to collect.")
-    collect.add_argument("--days", type=int, default=365, help="Number of days of daily bars.")
+    collect.add_argument(
+        "--days",
+        type=int,
+        help="Legacy override applied to all configured timeframe lookbacks.",
+    )
     collect.add_argument("--include-news", action="store_true", help="Collect recent Alpaca news.")
 
     eda = subparsers.add_parser("eda", help="Run exploratory data analysis over a symbol universe.")
@@ -62,14 +66,45 @@ def main() -> None:
 def _collect(args: argparse.Namespace, settings: Settings) -> None:
     service = AlpacaService(settings)
     workflow = TradingWorkflow(settings)
+    trading = settings.trading
     symbols = [symbol.upper() for symbol in (args.symbols or settings.trading.universe_symbols)]
-    bars_by_symbol = service.fetch_stock_bars(symbols, TimeFrameUnit.Day, args.days)
-    for symbol, frame in bars_by_symbol.items():
-        workflow.raw_lake.save_bars(symbol, "day", frame)
-        if args.include_news:
-            news = service.fetch_recent_news(symbol, days=settings.trading.news_lookback_days)
+    timeframe_requests = [
+        (
+            trading.short_timeframe,
+            trading.short_timeframe_multiplier,
+            _resolve_lookback_days(args.days, trading.short_lookback_days),
+        ),
+        (
+            trading.medium_timeframe,
+            trading.medium_timeframe_multiplier,
+            _resolve_lookback_days(args.days, trading.medium_lookback_days),
+        ),
+        (
+            trading.long_timeframe,
+            1,
+            _resolve_lookback_days(args.days, trading.long_lookback_days),
+        ),
+    ]
+
+    for timeframe_unit, timeframe_multiplier, lookback_days in timeframe_requests:
+        bars_by_symbol = service.fetch_stock_bars(
+            symbols,
+            TimeFrame(amount=timeframe_multiplier, unit=timeframe_unit),
+            lookback_days,
+        )
+        for symbol, frame in bars_by_symbol.items():
+            workflow.raw_lake.save_bars(
+                symbol,
+                _timeframe_storage_key(timeframe_unit, timeframe_multiplier),
+                frame,
+            )
+
+    if args.include_news:
+        for symbol in symbols:
+            news = service.fetch_recent_news(symbol, days=trading.news_lookback_days)
             workflow.raw_lake.save_news(symbol, news)
-    print(f"Collected daily bars for {', '.join(symbols)}")
+
+    print(f"Collected 15-minute, 2-hour, and daily bars for {', '.join(symbols)}")
 
 
 def _run_eda(args: argparse.Namespace, settings: Settings) -> None:
@@ -84,14 +119,24 @@ def _run_eda(args: argparse.Namespace, settings: Settings) -> None:
 def _run_backtest(args: argparse.Namespace, settings: Settings) -> None:
     symbol = (args.symbol or settings.trading.primary_symbol).upper()
     service = AlpacaService(settings)
-    main_bars = service.fetch_stock_bars(
-        [symbol], settings.trading.main_timeframe, settings.trading.main_lookback_days
+    trading = settings.trading
+    short_bars = service.fetch_stock_bars(
+        [symbol],
+        TimeFrame(amount=trading.short_timeframe_multiplier, unit=trading.short_timeframe),
+        trading.short_lookback_days,
     )[symbol]
-    trend_bars = service.fetch_stock_bars(
-        [symbol], settings.trading.trend_timeframe, settings.trading.trend_lookback_days
+    medium_bars = service.fetch_stock_bars(
+        [symbol],
+        TimeFrame(amount=trading.medium_timeframe_multiplier, unit=trading.medium_timeframe),
+        trading.medium_lookback_days,
+    )[symbol]
+    long_bars = service.fetch_stock_bars(
+        [symbol],
+        TimeFrame(amount=1, unit=trading.long_timeframe),
+        trading.long_lookback_days,
     )[symbol]
     backtester = StrategyBacktester(settings.trading)
-    summary = backtester.backtest(symbol, main_bars, trend_bars)
+    summary = backtester.backtest(symbol, short_bars, medium_bars, long_bars)
     output_dir = settings.paths.reports_dir / "backtests" / symbol.lower()
     backtester.write_outputs(summary, output_dir)
     workflow = TradingWorkflow(settings)
@@ -123,3 +168,11 @@ def _configure_logging(log_path: Path) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _resolve_lookback_days(override_days: int | None, default_days: int) -> int:
+    return override_days if override_days is not None else default_days
+
+
+def _timeframe_storage_key(timeframe_unit: TimeFrameUnit, multiplier: int = 1) -> str:
+    return f"{multiplier}{timeframe_unit.name.lower()}"

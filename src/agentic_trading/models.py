@@ -16,8 +16,9 @@ class Action(str, Enum):
 @dataclass
 class MarketContext:
     symbol: str
-    main_bars: pd.DataFrame
-    trend_bars: pd.DataFrame
+    short_bars: pd.DataFrame
+    medium_bars: pd.DataFrame
+    long_bars: pd.DataFrame
     latest_price: float
     market_open: bool
     buying_power: float
@@ -110,4 +111,3 @@ class BacktestSummary:
     win_rate: float
     trades: list[BacktestTrade]
     equity_curve: pd.DataFrame
-

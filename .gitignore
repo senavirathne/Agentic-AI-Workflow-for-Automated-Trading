@@ -9,9 +9,13 @@ __pycache__/
 *.egg-info/
 *.sqlite3
 build/
+docs/
+docs/*.md
+docs
 dist/
 logs/
 reports/output/
 data/raw/
 data/processed/
 data/*.db
+.DS_Store

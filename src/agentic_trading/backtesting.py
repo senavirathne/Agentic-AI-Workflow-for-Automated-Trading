@@ -17,11 +17,22 @@ from .utils import dump_json
 class StrategyBacktester:
     config: TradingConfig
 
-    def prepare_signal_frame(self, main_bars: pd.DataFrame, trend_bars: pd.DataFrame) -> pd.DataFrame:
-        return generate_signal_frame(main_bars, trend_bars, self.config)
+    def prepare_signal_frame(
+        self,
+        short_bars: pd.DataFrame,
+        medium_bars: pd.DataFrame,
+        long_bars: pd.DataFrame,
+    ) -> pd.DataFrame:
+        return generate_signal_frame(short_bars, medium_bars, long_bars, self.config)
 
-    def backtest(self, symbol: str, main_bars: pd.DataFrame, trend_bars: pd.DataFrame) -> BacktestSummary:
-        signal_frame = self.prepare_signal_frame(main_bars, trend_bars)
+    def backtest(
+        self,
+        symbol: str,
+        short_bars: pd.DataFrame,
+        medium_bars: pd.DataFrame,
+        long_bars: pd.DataFrame,
+    ) -> BacktestSummary:
+        signal_frame = self.prepare_signal_frame(short_bars, medium_bars, long_bars)
         cash = self.config.initial_capital
         qty = 0
         entry_price: float | None = None
@@ -158,4 +169,3 @@ def _signal_accuracy(signal_frame: pd.DataFrame, horizon: int) -> float:
         return 0.0
     correct = int(buy_checks.sum()) + int(sell_checks.sum())
     return correct / total
-

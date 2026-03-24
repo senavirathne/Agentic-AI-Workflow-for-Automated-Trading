@@ -21,6 +21,15 @@ def _split_csv(raw: str | None, default: list[str]) -> list[str]:
     return values or default
 
 
+def _parse_float(raw: str | None, default: float) -> float:
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Credentials:
     api_key: str | None
@@ -43,10 +52,14 @@ class TradingConfig:
         default_factory=lambda: ["TQQQ", "QQQ", "SPY", "AAPL", "MSFT", "NVDA", "AMD", "TSLA"]
     )
     market_timezone: str = "America/New_York"
-    main_timeframe: TimeFrameUnit = TimeFrameUnit.Hour
-    trend_timeframe: TimeFrameUnit = TimeFrameUnit.Day
-    main_lookback_days: int = 300
-    trend_lookback_days: int = 260
+    short_timeframe: TimeFrameUnit = TimeFrameUnit.Minute
+    short_timeframe_multiplier: int = 15
+    short_lookback_days: int = 30
+    medium_timeframe: TimeFrameUnit = TimeFrameUnit.Hour
+    medium_timeframe_multiplier: int = 2
+    medium_lookback_days: int = 90
+    long_timeframe: TimeFrameUnit = TimeFrameUnit.Day
+    long_lookback_days: int = 260
     news_lookback_days: int = 7
     rsi_period: int = 14
     macd_fast: int = 12
@@ -75,6 +88,15 @@ class CloudConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    enabled: bool = False
+    api_key: str | None = None
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-reasoner"
+    timeout_seconds: float = 45.0
+
+
+@dataclass(frozen=True)
 class Paths:
     project_root: Path
     data_dir: Path
@@ -100,6 +122,7 @@ class Settings:
     credentials: Credentials
     trading: TradingConfig
     cloud: CloudConfig
+    llm: LLMConfig
     paths: Paths
 
     @classmethod
@@ -133,5 +156,11 @@ class Settings:
             structured_store_uri=os.getenv("STRUCTURED_STORE_URI") or None,
             compute_target=os.getenv("COMPUTE_TARGET", "local").lower(),
         )
-        return cls(credentials=credentials, trading=trading, cloud=cloud, paths=paths)
-
+        llm = LLMConfig(
+            enabled=_parse_bool(os.getenv("LLM_ENABLED"), False),
+            api_key=os.getenv("DEEPSEEK_API_KEY") or None,
+            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner"),
+            timeout_seconds=_parse_float(os.getenv("LLM_TIMEOUT_SECONDS"), 45.0),
+        )
+        return cls(credentials=credentials, trading=trading, cloud=cloud, llm=llm, paths=paths)

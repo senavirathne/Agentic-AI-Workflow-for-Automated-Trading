@@ -1,8 +1,9 @@
 alpaca-py
+langgraph
 matplotlib
 numpy
+openai
 pandas
 python-dotenv
 scikit-learn
 pytest
-
