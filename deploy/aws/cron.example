@@ -1,3 +1,0 @@
-CRON_TZ=America/New_York
-30 9 * * 1-5 /home/ubuntu/agentic-alpaca-trading/.venv/bin/python -m agentic_trading.cli trade-loop --symbol TQQQ --execute >> /home/ubuntu/agentic-alpaca-trading/logs/workflow.log 2>&1
-

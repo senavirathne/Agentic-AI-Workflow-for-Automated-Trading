@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fresh-simple-trading-project"
+version = "0.1.0"
+description = "Fresh standalone hourly agentic trading workflow."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "alpaca-py",
+  "numpy",
+  "openai",
+  "pandas",
+  "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+fresh-trader = "fresh_simple_trading_project.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
