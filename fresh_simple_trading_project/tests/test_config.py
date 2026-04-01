@@ -20,6 +20,14 @@ ENV_KEYS = [
     "TRADE_API_URL",
     "ALPACA_TRADE_API_URL",
     "NEWS_MAX_AGE_DAYS",
+    "RAW_STORE_PROVIDER",
+    "RESULT_STORE_PROVIDER",
+    "DATABASE_URL",
+    "AZURE_STORAGE_ACCOUNT_URL",
+    "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_BLOB_CONTAINER_RAW",
+    "AZURE_BLOB_PREFIX",
+    "AZURE_KEY_VAULT_URL",
 ]
 
 
@@ -29,14 +37,18 @@ def test_settings_default_to_synthetic_provider(tmp_path: Path, monkeypatch) -> 
     settings = Settings.from_env(project_root=tmp_path)
 
     assert settings.market_data.provider == "synthetic"
+    assert settings.raw_store.provider == "local"
+    assert settings.result_store.provider == "sqlite"
     assert settings.alpaca.enabled is False
     assert settings.alpaca.paper_trading is True
     assert settings.news.max_age_days == 7
-    assert settings.trading.lookback_hours == 24
+    assert settings.trading.lookback_hours == 240
     assert settings.trading.eda_window_hours == 24
     assert settings.trading.support_resistance_lookback_days == 7
     assert settings.trading.live_sleep_seconds == 3600.0
     assert settings.trading.backtest_sleep_seconds == 1.0
+    assert settings.azure.blob_container_raw == "raw"
+    assert settings.result_store.database_url is not None
 
 
 def test_settings_use_notebook_alpaca_variables_when_present(tmp_path: Path, monkeypatch) -> None:
@@ -75,6 +87,34 @@ def test_settings_parse_news_max_age_days(tmp_path: Path, monkeypatch) -> None:
     settings = Settings.from_env(project_root=tmp_path)
 
     assert settings.news.max_age_days == 5
+
+
+def test_settings_parse_azure_storage_configuration(tmp_path: Path, monkeypatch) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("RAW_STORE_PROVIDER", "azure_blob")
+    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_URL", "https://example.blob.core.windows.net")
+    monkeypatch.setenv("AZURE_BLOB_CONTAINER_RAW", "trading-raw")
+    monkeypatch.setenv("AZURE_BLOB_PREFIX", "dev")
+    monkeypatch.setenv("AZURE_KEY_VAULT_URL", "https://vault-example.vault.azure.net")
+
+    settings = Settings.from_env(project_root=tmp_path)
+
+    assert settings.raw_store.provider == "azure_blob"
+    assert settings.azure.storage_account_url == "https://example.blob.core.windows.net"
+    assert settings.azure.blob_container_raw == "trading-raw"
+    assert settings.azure.blob_prefix == "dev"
+    assert settings.azure.key_vault_url == "https://vault-example.vault.azure.net"
+
+
+def test_settings_parse_azure_sql_configuration(tmp_path: Path, monkeypatch) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("RESULT_STORE_PROVIDER", "azure_sql")
+    monkeypatch.setenv("DATABASE_URL", "mssql+pyodbc://server/database")
+
+    settings = Settings.from_env(project_root=tmp_path)
+
+    assert settings.result_store.provider == "azure_sql"
+    assert settings.result_store.database_url == "mssql+pyodbc://server/database"
 
 
 def test_settings_reject_removed_market_data_provider(tmp_path: Path, monkeypatch) -> None:

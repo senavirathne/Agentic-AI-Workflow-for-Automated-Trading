@@ -14,6 +14,7 @@ from fresh_simple_trading_project.alpaca_integration import (
     AlpacaMarketDataClient,
     AlpacaService,
 )
+from fresh_simple_trading_project.data_collection import HistoricalReplayDataClient
 from fresh_simple_trading_project.config import AlpacaConfig
 from fresh_simple_trading_project.execution import ExecutionModule
 from fresh_simple_trading_project.storage import InMemoryResultStore
@@ -190,7 +191,7 @@ def test_build_workflow_uses_historical_alpaca_client_in_backtest_mode(
 
     workflow = workflow_module.build_workflow(project_root=tmp_path, mode="backtest")
 
-    assert isinstance(workflow.data_collection.market_data_client, AlpacaHistoricalMarketDataClient)
+    assert isinstance(workflow.data_collection.market_data_client, HistoricalReplayDataClient)
 
 
 class FakeStockHistoricalDataClient:

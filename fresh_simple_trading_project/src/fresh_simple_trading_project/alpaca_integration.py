@@ -48,7 +48,7 @@ class AlpacaService:
             secret_key=self.config.api_secret,
         )
 
-    def fetch_five_minute_bars(self, symbol: str, lookback_days: int) -> pd.DataFrame:
+    def fetch_five_minute_bars(self, symbol: str, lookback_days: int=None) -> pd.DataFrame:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -56,13 +56,12 @@ class AlpacaService:
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(amount=5, unit=TimeFrameUnit.Minute),
-            start=end - timedelta(days=lookback_days),
-            end=end,
+            start=end - timedelta(days=lookback_days) if lookback_days else None,         
         )
         frame = self.stock_data_client.get_stock_bars(request).df
         return _normalize_alpaca_bars(frame, symbol)
 
-    def fetch_hourly_bars(self, symbol: str, lookback_days: int) -> pd.DataFrame:
+    def fetch_hourly_bars(self, symbol: str, lookback_days: int=None) -> pd.DataFrame:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -70,8 +69,7 @@ class AlpacaService:
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(amount=1, unit=TimeFrameUnit.Hour),
-            start=end - timedelta(days=lookback_days),
-            end=end,
+            start=end - timedelta(days=lookback_days) if lookback_days else None,           
         )
         frame = self.stock_data_client.get_stock_bars(request).df
         return _normalize_alpaca_bars(frame, symbol)
@@ -103,7 +101,6 @@ class AlpacaService:
         request = NewsRequest(
             symbols=normalized_symbols,
             start=datetime.now(timezone.utc) - timedelta(days=days),
-            end=datetime.now(timezone.utc),
             limit=limit,
             include_content=True,
             exclude_contentless=False,

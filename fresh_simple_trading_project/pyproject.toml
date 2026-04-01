@@ -14,10 +14,12 @@ dependencies = [
   "openai",
   "pandas",
   "python-dotenv",
+  "SQLAlchemy",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+azure = ["azure-identity", "azure-storage-blob"]
 
 [project.scripts]
 fresh-trader = "fresh_simple_trading_project.cli:main"

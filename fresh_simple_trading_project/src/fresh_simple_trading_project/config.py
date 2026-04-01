@@ -68,6 +68,26 @@ class MarketDataConfig:
 
 
 @dataclass(frozen=True)
+class RawStoreConfig:
+    provider: str = "local"
+
+
+@dataclass(frozen=True)
+class ResultStoreConfig:
+    provider: str = "sqlite"
+    database_url: str | None = None
+
+
+@dataclass(frozen=True)
+class AzureConfig:
+    storage_account_url: str | None = None
+    storage_connection_string: str | None = None
+    blob_container_raw: str = "raw"
+    blob_prefix: str = ""
+    key_vault_url: str | None = None
+
+
+@dataclass(frozen=True)
 class AlpacaConfig:
     api_key: str | None = None
     api_secret: str | None = None
@@ -127,6 +147,9 @@ class Paths:
 class Settings:
     trading: TradingConfig
     market_data: MarketDataConfig
+    raw_store: RawStoreConfig
+    result_store: ResultStoreConfig
+    azure: AzureConfig
     alpaca: AlpacaConfig
     news: NewsConfig
     llm: LLMConfig
@@ -178,6 +201,18 @@ class Settings:
                 backtest_sleep_seconds=max(0.0, float(os.getenv("BACKTEST_SLEEP_SECONDS", "1.0"))),
             ),
             market_data=MarketDataConfig(provider=market_provider),
+            raw_store=RawStoreConfig(provider=_resolve_raw_store_provider()),
+            result_store=ResultStoreConfig(
+                provider=_resolve_result_store_provider(),
+                database_url=os.getenv("DATABASE_URL") or _sqlite_database_url(paths.database_path),
+            ),
+            azure=AzureConfig(
+                storage_account_url=os.getenv("AZURE_STORAGE_ACCOUNT_URL"),
+                storage_connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
+                blob_container_raw=os.getenv("AZURE_BLOB_CONTAINER_RAW", "raw"),
+                blob_prefix=os.getenv("AZURE_BLOB_PREFIX", "").strip("/"),
+                key_vault_url=os.getenv("AZURE_KEY_VAULT_URL"),
+            ),
             alpaca=alpaca,
             news=NewsConfig(
                 max_age_days=max(1, int(os.getenv("NEWS_MAX_AGE_DAYS", "7"))),
@@ -216,3 +251,25 @@ def _resolve_market_provider(*, alpaca_enabled: bool) -> str:
     if alpaca_enabled:
         return "alpaca"
     return "synthetic"
+
+
+def _resolve_raw_store_provider() -> str:
+    provider = os.getenv("RAW_STORE_PROVIDER", "local").strip().lower()
+    if provider in {"local", "azure_blob"}:
+        return provider
+    raise RuntimeError(
+        f"Unsupported RAW_STORE_PROVIDER={provider!r}. Use 'local' or 'azure_blob'."
+    )
+
+
+def _resolve_result_store_provider() -> str:
+    provider = os.getenv("RESULT_STORE_PROVIDER", "sqlite").strip().lower()
+    if provider in {"sqlite", "azure_sql"}:
+        return provider
+    raise RuntimeError(
+        f"Unsupported RESULT_STORE_PROVIDER={provider!r}. Use 'sqlite' or 'azure_sql'."
+    )
+
+
+def _sqlite_database_url(database_path: Path) -> str:
+    return f"sqlite:///{database_path.resolve()}"

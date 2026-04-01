@@ -34,7 +34,14 @@ from .llm import DeepSeekLLMClient, LLMRequestError
 from .market_analysis import MarketAnalysisModule
 from .models import CollectedMarketData, WorkflowResult
 from .risk_analysis import RiskAnalysisModule
-from .storage import LocalRawStore, SQLiteResultStore
+from .storage import (
+    AzureBlobRawStore,
+    AzureSQLResultStore,
+    LocalRawStore,
+    RawStore,
+    ResultStore,
+    SQLiteResultStore,
+)
 
 
 @dataclass
@@ -48,8 +55,8 @@ class TradingWorkflow:
     risk_analysis: RiskAnalysisModule
     decision_engine: DecisionEngine
     execution_module: ExecutionModule
-    raw_store: LocalRawStore
-    result_store: SQLiteResultStore
+    raw_store: RawStore
+    result_store: ResultStore
     default_sleep_seconds: float | None = None
 
     def run_once(self, symbol: str | None = None, execute_orders: bool = False) -> WorkflowResult:
@@ -67,8 +74,10 @@ class TradingWorkflow:
         collected: CollectedMarketData,
         execute_orders: bool,
     ) -> WorkflowResult:
-        self.raw_store.save_bars(symbol, "5min", collected.five_minute_bars)
-        self.raw_store.save_bars(symbol, "1h", collected.hourly_bars)
+        raw_artifacts = {
+            "five_minute_bars": self.raw_store.save_bars(symbol, "5min", collected.five_minute_bars),
+            "hourly_bars": self.raw_store.save_bars(symbol, "1h", collected.hourly_bars),
+        }
         eda = self.eda_module.summarize(
             symbol,
             collected.five_minute_bars.tail(self.settings.trading.eda_window_hours * 12),
@@ -84,7 +93,7 @@ class TradingWorkflow:
             symbol,
             lambda: self.information_retrieval.retrieve(symbol, limit=self.settings.trading.news_limit),
         )
-        self.raw_store.save_news(symbol, retrieval.articles)
+        raw_artifacts["news"] = self.raw_store.save_news(symbol, retrieval.articles)
         risk = self._run_llm_stage(
             "risk_analysis",
             symbol,
@@ -113,7 +122,7 @@ class TradingWorkflow:
             decision=decision,
             execution=execution,
         )
-        self.result_store.save_workflow_run(result)
+        self.result_store.save_workflow_run(result, raw_artifacts=raw_artifacts)
         self.result_store.save_last_processed(symbol, result.analysis.timestamp)
         return result
 
@@ -280,10 +289,35 @@ def build_workflow(
             decision_agent=decision_agent,
         ),
         execution_module=ExecutionModule(broker_client),
-        raw_store=LocalRawStore(settings.paths.raw_dir),
-        result_store=SQLiteResultStore(settings.paths.database_path),
+        raw_store=build_raw_store(settings),
+        result_store=build_result_store(settings),
         default_sleep_seconds=settings.trading.sleep_seconds,
     )
+
+
+def build_raw_store(settings: Settings) -> RawStore:
+    provider = settings.raw_store.provider
+    if provider == "local":
+        return LocalRawStore(settings.paths.raw_dir)
+    if provider == "azure_blob":
+        return AzureBlobRawStore(
+            container_name=settings.azure.blob_container_raw,
+            account_url=settings.azure.storage_account_url,
+            connection_string=settings.azure.storage_connection_string,
+            blob_prefix=settings.azure.blob_prefix,
+        )
+    raise RuntimeError(f"Unsupported raw store provider: {provider}")
+
+
+def build_result_store(settings: Settings) -> ResultStore:
+    provider = settings.result_store.provider
+    if provider == "sqlite":
+        return SQLiteResultStore(settings.paths.database_path)
+    if provider == "azure_sql":
+        if not settings.result_store.database_url:
+            raise RuntimeError("RESULT_STORE_PROVIDER=azure_sql requires DATABASE_URL.")
+        return AzureSQLResultStore(settings.result_store.database_url)
+    raise RuntimeError(f"Unsupported result store provider: {provider}")
 
 
 def _build_live_clients(
