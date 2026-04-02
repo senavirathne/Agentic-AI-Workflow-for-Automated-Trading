@@ -6,6 +6,7 @@ import time
 
 import pandas as pd
 
+from .alpha_vantage import AlphaVantageIndicatorService
 from .agents import DecisionCoordinatorAgent, NewsResearchAgent, RiskReviewAgent, TechnicalAnalysisAgent
 from .alpaca_integration import (
     AlpacaAccountClient,
@@ -57,6 +58,7 @@ class TradingWorkflow:
     execution_module: ExecutionModule
     raw_store: RawStore
     result_store: ResultStore
+    alpha_vantage_service: AlphaVantageIndicatorService | None = None
     default_sleep_seconds: float | None = None
 
     def run_once(self, symbol: str | None = None, execute_orders: bool = False) -> WorkflowResult:
@@ -83,10 +85,16 @@ class TradingWorkflow:
             collected.five_minute_bars.tail(self.settings.trading.eda_window_hours * 12),
         )
         feature_frame = self.feature_engineering.build(collected.five_minute_bars)
+        alpha_vantage_snapshot = self._build_alpha_vantage_indicator_snapshot(symbol)
         analysis = self._run_llm_stage(
             "market_analysis",
             symbol,
-            lambda: self.market_analysis.analyze(symbol, feature_frame, collected.hourly_bars),
+            lambda: self.market_analysis.analyze(
+                symbol,
+                feature_frame,
+                collected.hourly_bars,
+                alpha_vantage_snapshot=alpha_vantage_snapshot,
+            ),
         )
         retrieval = self._run_llm_stage(
             "information_retrieval",
@@ -121,8 +129,11 @@ class TradingWorkflow:
             risk=risk,
             decision=decision,
             execution=execution,
+            alpha_vantage_indicator_snapshot=alpha_vantage_snapshot,
         )
         self.result_store.save_workflow_run(result, raw_artifacts=raw_artifacts)
+        if alpha_vantage_snapshot is not None:
+            self.result_store.save_alpha_vantage_indicator_snapshot(alpha_vantage_snapshot)
         self.result_store.save_last_processed(symbol, result.analysis.timestamp)
         return result
 
@@ -136,6 +147,11 @@ class TradingWorkflow:
                 base_url=exc.base_url,
                 detail=f"workflow stage '{stage}' for symbol '{symbol}': {exc.detail}",
             ) from exc
+
+    def _build_alpha_vantage_indicator_snapshot(self, symbol: str):
+        if self.alpha_vantage_service is None:
+            return None
+        return self.alpha_vantage_service.build_snapshot(symbol)
 
     def run_loop(
         self,
@@ -245,6 +261,9 @@ def build_workflow(
     news_agent = NewsResearchAgent(llm_client=llm_client)
     risk_agent = RiskReviewAgent(llm_client=llm_client)
     decision_agent = DecisionCoordinatorAgent(llm_client=llm_client)
+    alpha_vantage_service = None
+    if settings.alpha_vantage.enabled:
+        alpha_vantage_service = AlphaVantageIndicatorService(settings.alpha_vantage)
     alpaca_service = AlpacaService(settings.alpaca) if settings.alpaca.enabled else None
 
     if settings.trading.mode == RunMode.LIVE:
@@ -291,6 +310,7 @@ def build_workflow(
         execution_module=ExecutionModule(broker_client),
         raw_store=build_raw_store(settings),
         result_store=build_result_store(settings),
+        alpha_vantage_service=alpha_vantage_service,
         default_sleep_seconds=settings.trading.sleep_seconds,
     )
 
@@ -434,12 +454,15 @@ def _print_reasoning(result: WorkflowResult) -> None:
 def format_reasoning_lines(result: WorkflowResult, prefix: str = "  ") -> list[str]:
     lines = [
         f"{prefix}Data Window: {_data_window(result)}",
+        f"{prefix}Alpha Vantage: {_alpha_vantage_window(result)}",
         f"{prefix}Technical Agent: {_display_reason(result.analysis.llm_summary)}",
         f"{prefix}News Agent: {_display_reason(result.retrieval.summary_note)}",
         f"{prefix}Risk Agent: {_display_reason(result.risk.summary_note)}",
     ]
     for idx, headline in enumerate(result.retrieval.headline_summary, 1):
         lines.append(f"{prefix}Headline {idx}: {headline}")
+    for idx, item in enumerate(result.retrieval.critical_news, 1):
+        lines.append(f"{prefix}Critical News {idx}: {item}")
     for idx, warning in enumerate(result.risk.warnings, 1):
         lines.append(f"{prefix}Risk Warning {idx}: {warning}")
     if result.decision.rationale:
@@ -461,6 +484,18 @@ def _data_window(result: WorkflowResult) -> str:
     return (
         f"5min {_frame_window(result.five_minute_bars)} | "
         f"1h {_frame_window(result.hourly_bars)}"
+    )
+
+
+def _alpha_vantage_window(result: WorkflowResult) -> str:
+    snapshot = result.alpha_vantage_indicator_snapshot
+    if snapshot is None:
+        return "<not configured>"
+    if snapshot.latest_hour_chunk is None:
+        return f"{snapshot.trading_day} | no hourly chunk"
+    return (
+        f"{snapshot.trading_day} | "
+        f"{snapshot.latest_hour_chunk.slot_start} -> {snapshot.latest_hour_chunk.slot_end}"
     )
 
 

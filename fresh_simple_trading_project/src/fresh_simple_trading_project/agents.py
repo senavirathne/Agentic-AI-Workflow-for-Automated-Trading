@@ -15,6 +15,14 @@ class DecisionReview:
     override: str | None = None
 
 
+@dataclass(frozen=True)
+class NewsResearchSummary:
+    summary_note: str | None = None
+    critical_news: list[str] | None = None
+    risk_flags: list[str] | None = None
+    catalysts: list[str] | None = None
+
+
 @dataclass
 class TechnicalAnalysisAgent:
     llm_client: TextGenerationClient | None = None
@@ -41,9 +49,22 @@ class TechnicalAnalysisAgent:
         nearest_resistance: float | None,
         local_support_region: tuple[float, float] | None,
         local_resistance_region: tuple[float, float] | None,
+        alpha_vantage_latest_hour_chunk: list[dict[str, object]] | None = None,
+        alpha_vantage_threshold_hits: list[str] | None = None,
     ) -> str | None:
         if self.llm_client is None:
             return None
+
+        alpha_vantage_lines: list[str] = []
+        if alpha_vantage_latest_hour_chunk:
+            alpha_vantage_lines.extend(
+                [
+                    "Alpha Vantage latest 1-hour indicator chunk (5-minute rows, JSON):",
+                    json.dumps(alpha_vantage_latest_hour_chunk, separators=(",", ":")),
+                ]
+            )
+        if alpha_vantage_threshold_hits:
+            alpha_vantage_lines.append(f"Alpha Vantage threshold hits in latest chunk: {alpha_vantage_threshold_hits}")
 
         raw = self.llm_client.generate(
             self.SYSTEM_PROMPT,
@@ -65,6 +86,7 @@ class TechnicalAnalysisAgent:
                     f"Major resistance (hourly): {nearest_resistance}",
                     f"Local support region (5-minute): {local_support_region}",
                     f"Local resistance region (5-minute): {local_resistance_region}",
+                    *alpha_vantage_lines,
                     "The handoff must explicitly include the current datetime and current price.",
                     "Return one short technical handoff for the decision-making agent.",
                 ]
@@ -92,12 +114,9 @@ class NewsResearchAgent:
         *,
         symbol: str,
         articles: list[NewsArticle],
-        sentiment: float,
-        risk_flags: list[str],
-        catalysts: list[str],
         search_queries: list[str],
         limit: int | None = None,
-    ) -> str | None:
+    ) -> NewsResearchSummary | None:
         if self.llm_client is None or not articles:
             return None
 
@@ -110,19 +129,23 @@ class NewsResearchAgent:
                     "Search focus: symbol-specific news, American economy developments, and overall U.S. stock market trend.",
                     "Queries used:",
                     *[f"- {query}" for query in search_queries],
-                    f"Rule-based sentiment score: {sentiment:.2f}",
-                    f"Risk flags: {risk_flags}",
-                    f"Catalysts: {catalysts}",
                     "Recent articles:",
                     *[
                         f"- {article.headline} | {article.summary} | source={article.source} | published_at={article.published_at}"
                         for article in articles[:article_limit]
                     ],
-                    "Return one short news handoff for the decision-making agent.",
+                    "Review all provided articles.",
+                    "Identify only the critical news items that materially affect trading decisions.",
+                    "Return JSON with keys: summary_note, critical_news, risk_flags, catalysts.",
+                    "summary_note must be a precise short summary for the decision-making agent.",
+                    "critical_news must be an ordered array of the most material items, highest impact first.",
+                    "risk_flags must list concrete downside risks from the provided news only.",
+                    "catalysts must list concrete catalysts from the provided news only.",
+                    "Do not produce or rely on a sentiment score.",
                 ]
             ),
         )
-        return clean_llm_text(raw)
+        return _parse_news_research_summary(clean_llm_text(raw))
 
 
 @dataclass
@@ -161,7 +184,10 @@ class RiskReviewAgent:
                     f"Trend: {analysis.trend}",
                     f"EDA volatility: {eda.candle_volatility:.4f}",
                     f"EDA anomaly count: {eda.anomaly_count}",
-                    f"News sentiment: {retrieval.sentiment_score:.2f}",
+                    f"Critical news: {retrieval.critical_news}",
+                    f"News risks: {retrieval.risk_flags}",
+                    f"News catalysts: {retrieval.catalysts}",
+                    f"News agent handoff: {retrieval.summary_note}",
                     f"Warnings: {warnings}",
                     "Return one short risk handoff for the decision-making agent.",
                 ]
@@ -222,7 +248,7 @@ class DecisionCoordinatorAgent:
                     f"Distance to support pct: {analysis.distance_to_support_pct}",
                     f"Distance to resistance pct: {analysis.distance_to_resistance_pct}",
                     f"Technical agent handoff: {analysis.llm_summary}",
-                    f"News sentiment: {retrieval.sentiment_score:.2f}",
+                    f"Critical news: {retrieval.critical_news}",
                     f"News risks: {retrieval.risk_flags}",
                     f"News catalysts: {retrieval.catalysts}",
                     f"News headlines: {retrieval.headline_summary}",
@@ -284,6 +310,32 @@ def _parse_review(raw: str | None) -> DecisionReview:
     return DecisionReview(action=action, quantity=quantity, note=note, override=override)
 
 
+def _parse_news_research_summary(raw: str | None) -> NewsResearchSummary:
+    cleaned = clean_llm_text(raw)
+    if not cleaned:
+        return NewsResearchSummary(summary_note=None, critical_news=[], risk_flags=[], catalysts=[])
+
+    if cleaned.lstrip().startswith("{"):
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return NewsResearchSummary(
+                summary_note=_as_string(payload.get("summary_note") or payload.get("summary") or payload.get("note")),
+                critical_news=_as_string_list(payload.get("critical_news")),
+                risk_flags=_as_string_list(payload.get("risk_flags")),
+                catalysts=_as_string_list(payload.get("catalysts")),
+            )
+
+    return NewsResearchSummary(
+        summary_note=cleaned,
+        critical_news=[],
+        risk_flags=[],
+        catalysts=[],
+    )
+
+
 def _ensure_technical_handoff_fields(
     *,
     symbol: str,
@@ -328,3 +380,13 @@ def _as_string(value: Any) -> str | None:
         return None
     candidate = str(value).strip()
     return candidate or None
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = [_as_string(item) for item in value]
+        return [item for item in items if item]
+    candidate = _as_string(value)
+    return [candidate] if candidate else []

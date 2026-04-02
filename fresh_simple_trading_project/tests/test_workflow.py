@@ -22,7 +22,7 @@ from fresh_simple_trading_project.information_retrieval import (
 )
 from fresh_simple_trading_project.llm import LLMRequestError, TextGenerationClient
 from fresh_simple_trading_project.market_analysis import MarketAnalysisModule
-from fresh_simple_trading_project.models import NewsArticle
+from fresh_simple_trading_project.models import AlphaVantageIndicatorSnapshot, IndicatorHourChunk, NewsArticle
 from fresh_simple_trading_project.risk_analysis import RiskAnalysisModule
 from fresh_simple_trading_project.storage import InMemoryResultStore, LocalRawStore
 from fresh_simple_trading_project.workflow import TradingWorkflow
@@ -36,7 +36,7 @@ def test_run_once_executes_fresh_hourly_architecture(tmp_path: Path) -> None:
     assert result.symbol == "AAPL"
     assert len(result.five_minute_bars) > len(result.hourly_bars)
     assert result.analysis.entry_setup is True
-    assert result.retrieval.sentiment_score > 0
+    assert result.retrieval.headline_summary
     assert result.decision.action.value == "BUY"
     assert result.execution.status == "dry_run"
 
@@ -143,7 +143,29 @@ def test_agents_receive_plain_text_inputs_only(tmp_path: Path) -> None:
     assert "tool" not in decision_prompt.lower()
     assert "RSI:" in technical_prompt
     assert "Recent articles:" in news_prompt
+    assert "Rule-based sentiment score" not in news_prompt
     assert "News headlines:" in decision_prompt
+
+
+def test_technical_agent_receives_latest_alpha_vantage_hour_chunk(tmp_path: Path) -> None:
+    llm_client = StubLLM(
+        [
+            "Technical prompt confirms the Alpha Vantage hour chunk.",
+            "News flow is positive.",
+            "Risk remains acceptable.",
+            "OVERRIDE=KEEP\nNOTE=The rule-based decision is acceptable.",
+        ]
+    )
+    workflow = _build_workflow(tmp_path, llm_client=llm_client)
+    workflow.alpha_vantage_service = StubAlphaVantageService(_sample_alpha_vantage_snapshot())
+
+    workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    technical_prompt = llm_client.calls[0][1]
+    assert "Alpha Vantage latest 1-hour indicator chunk" in technical_prompt
+    assert "\"time\":\"2025-01-03 11:00:00\"" in technical_prompt
+    assert "Alpha Vantage threshold hits in latest chunk" in technical_prompt
+    assert "RSI_OVERBOUGHT" in technical_prompt
 
 
 def test_workflow_wraps_llm_errors_with_stage_context(tmp_path: Path) -> None:
@@ -202,9 +224,10 @@ def test_format_reasoning_lines_show_agent_outputs_and_placeholders(tmp_path: Pa
     lines = workflow_module.format_reasoning_lines(result)
 
     assert "Data Window:" in lines[0]
-    assert "Technical Agent: <no output returned>" in lines[1]
-    assert "News Agent: <no output returned>" in lines[2]
-    assert "Risk Agent: <no output returned>" in lines[3]
+    assert "Alpha Vantage: <not configured>" in lines[1]
+    assert "Technical Agent: <no output returned>" in lines[2]
+    assert "News Agent: <no output returned>" in lines[3]
+    assert "Risk Agent: <no output returned>" in lines[4]
     assert any(line.startswith("  Decision Reason") for line in lines)
 
 
@@ -298,3 +321,43 @@ class RaisingLLM(TextGenerationClient):
             base_url="https://api.deepseek.com",
             detail="ModuleNotFoundError: No module named 'openai'",
         )
+
+
+class StubAlphaVantageService:
+    def __init__(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
+        self.snapshot = snapshot
+
+    def build_snapshot(self, symbol: str) -> AlphaVantageIndicatorSnapshot:
+        return self.snapshot
+
+
+def _sample_alpha_vantage_snapshot() -> AlphaVantageIndicatorSnapshot:
+    rows = [
+        {
+            "time": "2025-01-03 11:00:00",
+            "RSI": 62.0,
+            "ADX": 22.0,
+            "threshold_hits": ["ADX_STRONG_TREND"],
+        },
+        {
+            "time": "2025-01-03 11:05:00",
+            "RSI": 72.0,
+            "ADX": 28.0,
+            "threshold_hits": ["RSI_OVERBOUGHT", "ADX_STRONG_TREND"],
+        },
+    ]
+    latest_chunk = IndicatorHourChunk(
+        slot_start="2025-01-03 11:00:00",
+        slot_end="2025-01-03 11:05:00",
+        rows=rows,
+    )
+    return AlphaVantageIndicatorSnapshot(
+        symbol="AAPL",
+        interval="5min",
+        trading_day="2025-01-03",
+        latest_timestamp="2025-01-03 11:05:00",
+        indicator_columns=["RSI", "ADX"],
+        rows=rows,
+        hourly_chunks=[latest_chunk],
+        latest_hour_chunk=latest_chunk,
+    )

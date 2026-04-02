@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import secrets
+import string
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -78,6 +80,33 @@ class ResultStoreConfig:
     database_url: str | None = None
 
 
+def generate_random_alpha_vantage_api_key(length: int = 13) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+@dataclass(frozen=True)
+class AlphaVantageConfig:
+    api_key: str | None = None
+    generated_api_key: str = field(default_factory=generate_random_alpha_vantage_api_key)
+    base_url: str = "https://www.alphavantage.co/query"
+    interval: str = "5min"
+    request_pause_seconds: float = 15.0
+    max_retries: int = 3
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    def require(self) -> None:
+        if self.enabled:
+            return
+        raise RuntimeError(
+            "Missing Alpha Vantage credentials. Set ALPHA_VANTAGE_API_KEY. "
+            "A 13-character placeholder was generated, but Alpha Vantage requests require a real issued key."
+        )
+
+
 @dataclass(frozen=True)
 class AzureConfig:
     storage_account_url: str | None = None
@@ -149,6 +178,7 @@ class Settings:
     market_data: MarketDataConfig
     raw_store: RawStoreConfig
     result_store: ResultStoreConfig
+    alpha_vantage: AlphaVantageConfig
     azure: AzureConfig
     alpaca: AlpacaConfig
     news: NewsConfig
@@ -205,6 +235,13 @@ class Settings:
             result_store=ResultStoreConfig(
                 provider=_resolve_result_store_provider(),
                 database_url=os.getenv("DATABASE_URL") or _sqlite_database_url(paths.database_path),
+            ),
+            alpha_vantage=AlphaVantageConfig(
+                api_key=os.getenv("ALPHA_VANTAGE_API_KEY"),
+                base_url=os.getenv("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"),
+                interval=os.getenv("ALPHA_VANTAGE_INTERVAL", "5min"),
+                request_pause_seconds=max(0.0, float(os.getenv("ALPHA_VANTAGE_CALL_PAUSE_SECONDS", "15.0"))),
+                max_retries=max(1, int(os.getenv("ALPHA_VANTAGE_MAX_RETRIES", "3"))),
             ),
             azure=AzureConfig(
                 storage_account_url=os.getenv("AZURE_STORAGE_ACCOUNT_URL"),

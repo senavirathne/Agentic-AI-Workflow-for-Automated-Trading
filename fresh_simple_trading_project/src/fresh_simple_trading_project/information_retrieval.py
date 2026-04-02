@@ -18,8 +18,6 @@ from .models import NewsArticle, RetrievalResult
 
 logger = logging.getLogger(__name__)
 
-POSITIVE_KEYWORDS = {"beat", "growth", "surge", "upgrade", "approval", "profit", "buyback"}
-NEGATIVE_KEYWORDS = {"downgrade", "lawsuit", "fraud", "miss", "recall", "probe", "bankruptcy"}
 NEWS_SEARCH_FOCUS = [
     "symbol-specific news",
     "American economy developments",
@@ -54,6 +52,8 @@ MARKET_KEYWORDS = {
     "selloff",
 }
 MARKET_PROXY_SYMBOLS = ["SPY", "QQQ", "DIA", "IWM"]
+NEWS_AGENT_MAX_INPUT_CHARS = 12_000
+NEWS_AGENT_SEARCH_LIMIT_PER_QUERY = 40
 
 
 class NewsSearchClient(Protocol):
@@ -181,7 +181,7 @@ class InformationRetrievalModule:
 
     def retrieve(self, symbol: str, limit: int = 10) -> RetrievalResult:
         queries = _build_news_queries(symbol)
-        per_query_limit = max(3, limit)
+        per_query_limit = max(limit, NEWS_AGENT_SEARCH_LIMIT_PER_QUERY)
         article_batches = [
             _filter_recent_articles(
                 self.news_client.search_news(query, limit=per_query_limit),
@@ -189,45 +189,30 @@ class InformationRetrievalModule:
             )
             for query in queries
         ]
-        articles = _interleave_unique_articles(article_batches, max_items=limit)
-        positive_hits = 0
-        negative_hits = 0
-        risk_flags: list[str] = []
-        catalysts: list[str] = []
-        headlines: list[str] = []
-
-        for article in articles:
-            body = f"{article.headline} {article.summary}".lower()
-            positive_hits += sum(keyword in body for keyword in POSITIVE_KEYWORDS)
-            negative_hits += sum(keyword in body for keyword in NEGATIVE_KEYWORDS)
-            headlines.append(article.headline)
-            if "earnings" in body and "earnings" not in catalysts:
-                catalysts.append("earnings")
-            if "upgrade" in body and "analyst upgrade" not in catalysts:
-                catalysts.append("analyst upgrade")
-            if "downgrade" in body and "analyst downgrade" not in catalysts:
-                catalysts.append("analyst downgrade")
-
-        total_hits = positive_hits + negative_hits
-        sentiment = 0.0 if total_hits == 0 else round((positive_hits - negative_hits) / total_hits, 2)
-        if negative_hits > positive_hits:
-            risk_flags.append("Headline sentiment is net negative.")
-        if any(keyword in " ".join(headlines).lower() for keyword in {"lawsuit", "fraud", "bankruptcy"}):
-            risk_flags.append("At least one headline contains a high-risk keyword.")
-        summary_note = self._summarize_with_llm(
+        candidate_articles = _sort_articles_newest_first(
+            _interleave_unique_articles(article_batches, max_items=max(limit * 4, NEWS_AGENT_SEARCH_LIMIT_PER_QUERY))
+        )
+        articles = _select_articles_for_news_agent(
+            candidate_articles,
+            max_input_chars=NEWS_AGENT_MAX_INPUT_CHARS,
+        )
+        headlines = [article.headline for article in articles[:limit]]
+        news_summary = self._summarize_with_llm(
             symbol=symbol,
-            articles=articles[:limit],
-            sentiment=sentiment,
-            risk_flags=risk_flags,
-            catalysts=catalysts,
+            articles=articles,
             search_queries=queries,
         )
+        summary_note = news_summary.summary_note if news_summary is not None else None
+        critical_news = news_summary.critical_news if news_summary and news_summary.critical_news else []
+        risk_flags = news_summary.risk_flags if news_summary and news_summary.risk_flags else []
+        catalysts = news_summary.catalysts if news_summary and news_summary.catalysts else []
 
         return RetrievalResult(
             symbol=symbol,
             articles=articles,
-            headline_summary=headlines[:limit],
-            sentiment_score=sentiment,
+            headline_summary=headlines,
+            sentiment_score=0.0,
+            critical_news=critical_news,
             risk_flags=risk_flags,
             catalysts=catalysts,
             summary_note=summary_note,
@@ -238,20 +223,14 @@ class InformationRetrievalModule:
         *,
         symbol: str,
         articles: list[NewsArticle],
-        sentiment: float,
-        risk_flags: list[str],
-        catalysts: list[str],
         search_queries: list[str],
-    ) -> str | None:
+    ):
         if self.news_agent is None:
             return None
 
         return self.news_agent.summarize(
             symbol=symbol,
             articles=articles,
-            sentiment=sentiment,
-            risk_flags=risk_flags,
-            catalysts=catalysts,
             search_queries=search_queries,
         )
 
@@ -281,6 +260,34 @@ def _interleave_unique_articles(article_batches: list[list[NewsArticle]], max_it
     return merged
 
 
+def _sort_articles_newest_first(articles: list[NewsArticle]) -> list[NewsArticle]:
+    return sorted(
+        articles,
+        key=lambda article: _parse_published_at(article.published_at) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def _select_articles_for_news_agent(
+    articles: list[NewsArticle],
+    *,
+    max_input_chars: int,
+) -> list[NewsArticle]:
+    if not articles:
+        return []
+
+    selected: list[NewsArticle] = []
+    used_chars = 0
+    for article in articles:
+        article_text = _news_agent_article_line(article)
+        article_chars = len(article_text)
+        if selected and used_chars + article_chars > max_input_chars:
+            break
+        selected.append(article)
+        used_chars += article_chars
+    return selected
+
+
 def _filter_recent_articles(articles: list[NewsArticle], max_age_days: int) -> list[NewsArticle]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, max_age_days))
     recent: list[NewsArticle] = []
@@ -290,6 +297,13 @@ def _filter_recent_articles(articles: list[NewsArticle], max_age_days: int) -> l
             continue
         recent.append(article)
     return recent
+
+
+def _news_agent_article_line(article: NewsArticle) -> str:
+    return (
+        f"- {article.headline} | {article.summary} | source={article.source} | "
+        f"published_at={article.published_at}\n"
+    )
 
 
 def _parse_published_at(raw: str | None) -> datetime | None:
@@ -310,13 +324,13 @@ def _parse_published_at(raw: str | None) -> datetime | None:
 
 
 def _article_key(article: NewsArticle) -> str:
+    url = article.url.strip()
+    if url:
+        return url.lower()
     headline = article.headline.strip().lower()
     source = article.source.strip().lower()
     if headline and source:
         return f"{headline} | {source}"
-    url = article.url.strip()
-    if url:
-        return url.lower()
     return " | ".join(
         [
             headline,

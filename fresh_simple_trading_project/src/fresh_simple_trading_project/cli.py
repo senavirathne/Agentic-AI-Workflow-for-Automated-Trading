@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
 
+from .alpha_vantage import AlphaVantageIndicatorService
 from .backtesting import summarize_backtest_results
-from .config import RunMode
-from .models import WorkflowResult
-from .workflow import build_workflow, format_reasoning_lines
+from .config import RunMode, Settings
+from .models import AlphaVantageIndicatorSnapshot, WorkflowResult
+from .workflow import build_result_store, build_workflow, format_reasoning_lines
 
 
 def main() -> None:
@@ -29,8 +31,17 @@ def main() -> None:
     trade_once.add_argument("--execute", action="store_true")
     trade_once.add_argument("--json", action="store_true")
 
+    alpha_vantage_cmd = subparsers.add_parser("alpha-vantage-indicators")
+    alpha_vantage_cmd.add_argument("--symbol", default=None)
+    alpha_vantage_cmd.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
-    _override_runtime_env(mode=args.mode, symbol=args.symbol)
+    _override_runtime_env(mode=getattr(args, "mode", None), symbol=getattr(args, "symbol", None))
+
+    if args.command == "alpha-vantage-indicators":
+        _print_alpha_vantage_snapshot(symbol=args.symbol)
+        return
+
     workflow = build_workflow(project_root=Path.cwd())
 
     if args.command == "run":
@@ -146,6 +157,7 @@ def _trade_once_payload(mode: RunMode, result: WorkflowResult) -> dict[str, obje
         "quantity": result.decision.quantity,
         "confidence": result.decision.confidence,
         "execution_status": result.execution.status,
+        "alpha_vantage_indicator_snapshot": _alpha_vantage_payload(result.alpha_vantage_indicator_snapshot),
         "reasoning": _reasoning_payload(result),
     }
 
@@ -154,10 +166,12 @@ def _reasoning_payload(result: WorkflowResult) -> dict[str, object]:
     return {
         "technical_agent": result.analysis.llm_summary,
         "news_agent": result.retrieval.summary_note,
+        "critical_news": result.retrieval.critical_news,
         "risk_agent": result.risk.summary_note,
         "risk_warnings": result.risk.warnings,
         "decision_rationale": result.decision.rationale,
         "headline_summary": result.retrieval.headline_summary,
+        "alpha_vantage_indicator_snapshot": _alpha_vantage_payload(result.alpha_vantage_indicator_snapshot),
     }
 
 
@@ -174,6 +188,21 @@ def _format_trade_once_output(mode: RunMode, result: WorkflowResult) -> str:
     ]
     lines.extend(format_reasoning_lines(result, prefix="  "))
     return "\n".join(lines)
+
+
+def _alpha_vantage_payload(snapshot: AlphaVantageIndicatorSnapshot | None) -> dict[str, object] | None:
+    if snapshot is None:
+        return None
+    return asdict(snapshot)
+
+
+def _print_alpha_vantage_snapshot(*, symbol: str | None) -> None:
+    settings = Settings.from_env(project_root=Path.cwd())
+    target_symbol = (symbol or settings.trading.symbol).upper()
+    service = AlphaVantageIndicatorService(settings.alpha_vantage)
+    snapshot = service.build_snapshot(target_symbol)
+    build_result_store(settings).save_alpha_vantage_indicator_snapshot(snapshot)
+    print(json.dumps(asdict(snapshot), indent=2))
 
 
 if __name__ == "__main__":

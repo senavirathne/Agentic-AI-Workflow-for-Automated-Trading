@@ -7,7 +7,7 @@ import pandas as pd
 from .agents import TechnicalAnalysisAgent
 from .config import TradingConfig
 from .llm import TextGenerationClient
-from .models import AnalysisResult
+from .models import AlphaVantageIndicatorSnapshot, AnalysisResult
 
 
 @dataclass
@@ -25,6 +25,7 @@ class MarketAnalysisModule:
         symbol: str,
         feature_frame: pd.DataFrame,
         hourly_bars: pd.DataFrame | None = None,
+        alpha_vantage_snapshot: AlphaVantageIndicatorSnapshot | None = None,
     ) -> AnalysisResult:
         latest = feature_frame.iloc[-1]
         analysis_timestamp = _as_utc_timestamp(feature_frame.index[-1])
@@ -98,7 +99,19 @@ class MarketAnalysisModule:
             nearest_resistance=nearest_resistance,
             local_support_region=nearest_support_region,
             local_resistance_region=nearest_resistance_region,
+            alpha_vantage_snapshot=alpha_vantage_snapshot,
         )
+        if alpha_vantage_snapshot is not None:
+            notes.append(
+                "Alpha Vantage indicator table available for "
+                f"{alpha_vantage_snapshot.trading_day} with {len(alpha_vantage_snapshot.rows)} aligned 5-minute rows."
+            )
+            if alpha_vantage_snapshot.latest_hour_chunk is not None:
+                notes.append(
+                    "Alpha Vantage latest hour slot="
+                    f"{alpha_vantage_snapshot.latest_hour_chunk.slot_start} -> "
+                    f"{alpha_vantage_snapshot.latest_hour_chunk.slot_end}."
+                )
         if llm_summary:
             notes.append(f"LLM technical summary: {llm_summary}")
         return AnalysisResult(
@@ -140,10 +153,12 @@ class MarketAnalysisModule:
         nearest_resistance: float | None,
         local_support_region: tuple[float, float] | None,
         local_resistance_region: tuple[float, float] | None,
+        alpha_vantage_snapshot: AlphaVantageIndicatorSnapshot | None,
     ) -> str | None:
         if self.technical_agent is None:
             return None
 
+        latest_hour_chunk = alpha_vantage_snapshot.latest_hour_chunk.rows if alpha_vantage_snapshot and alpha_vantage_snapshot.latest_hour_chunk else None
         return self.technical_agent.summarize(
             symbol=symbol,
             as_of=analysis_timestamp.isoformat().replace("+00:00", "Z"),
@@ -159,6 +174,8 @@ class MarketAnalysisModule:
             nearest_resistance=nearest_resistance,
             local_support_region=local_support_region,
             local_resistance_region=local_resistance_region,
+            alpha_vantage_latest_hour_chunk=latest_hour_chunk,
+            alpha_vantage_threshold_hits=_latest_chunk_threshold_hits(alpha_vantage_snapshot),
         )
 
 
@@ -305,3 +322,12 @@ def _region_midpoint(region: tuple[float, float]) -> float:
 
 def _format_region(region: tuple[float, float]) -> str:
     return f"{region[0]:.2f}-{region[1]:.2f}"
+
+
+def _latest_chunk_threshold_hits(snapshot: AlphaVantageIndicatorSnapshot | None) -> list[str]:
+    if snapshot is None or snapshot.latest_hour_chunk is None:
+        return []
+    hits: list[str] = []
+    for row in snapshot.latest_hour_chunk.rows:
+        hits.extend(str(hit) for hit in row.get("threshold_hits", []) if hit)
+    return list(dict.fromkeys(hits))

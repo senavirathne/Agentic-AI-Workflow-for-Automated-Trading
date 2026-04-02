@@ -23,6 +23,11 @@ ENV_KEYS = [
     "RAW_STORE_PROVIDER",
     "RESULT_STORE_PROVIDER",
     "DATABASE_URL",
+    "ALPHA_VANTAGE_API_KEY",
+    "ALPHA_VANTAGE_BASE_URL",
+    "ALPHA_VANTAGE_INTERVAL",
+    "ALPHA_VANTAGE_CALL_PAUSE_SECONDS",
+    "ALPHA_VANTAGE_MAX_RETRIES",
     "AZURE_STORAGE_ACCOUNT_URL",
     "AZURE_STORAGE_CONNECTION_STRING",
     "AZURE_BLOB_CONTAINER_RAW",
@@ -39,6 +44,8 @@ def test_settings_default_to_synthetic_provider(tmp_path: Path, monkeypatch) -> 
     assert settings.market_data.provider == "synthetic"
     assert settings.raw_store.provider == "local"
     assert settings.result_store.provider == "sqlite"
+    assert settings.alpha_vantage.enabled is False
+    assert len(settings.alpha_vantage.generated_api_key) == 13
     assert settings.alpaca.enabled is False
     assert settings.alpaca.paper_trading is True
     assert settings.news.max_age_days == 7
@@ -115,6 +122,20 @@ def test_settings_parse_azure_sql_configuration(tmp_path: Path, monkeypatch) -> 
 
     assert settings.result_store.provider == "azure_sql"
     assert settings.result_store.database_url == "mssql+pyodbc://server/database"
+
+
+def test_settings_parse_alpha_vantage_configuration(tmp_path: Path, monkeypatch) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", "ABCDEFGHI1234")
+    monkeypatch.setenv("ALPHA_VANTAGE_CALL_PAUSE_SECONDS", "0.5")
+    monkeypatch.setenv("ALPHA_VANTAGE_MAX_RETRIES", "4")
+
+    settings = Settings.from_env(project_root=tmp_path)
+
+    assert settings.alpha_vantage.enabled is True
+    assert settings.alpha_vantage.api_key == "ABCDEFGHI1234"
+    assert settings.alpha_vantage.request_pause_seconds == 0.5
+    assert settings.alpha_vantage.max_retries == 4
 
 
 def test_settings_reject_removed_market_data_provider(tmp_path: Path, monkeypatch) -> None:

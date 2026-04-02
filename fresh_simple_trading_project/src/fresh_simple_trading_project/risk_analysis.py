@@ -34,11 +34,8 @@ class RiskAnalysisModule:
         if eda.anomaly_count > 0:
             risk_score += 0.15
             warnings.append("Recent data contains anomaly signals.")
-        if retrieval.sentiment_score < 0:
-            risk_score += 0.15
-            warnings.append("Recent news sentiment is negative.")
         if retrieval.risk_flags:
-            risk_score += 0.1
+            risk_score += 0.15
             warnings.extend(retrieval.risk_flags)
         if not account.market_open:
             warnings.append("Market is closed.")

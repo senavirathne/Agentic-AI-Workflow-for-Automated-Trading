@@ -60,12 +60,15 @@ fresh_simple_trading_project/
 cd fresh_simple_trading_project
 python -m pytest
 PYTHONPATH=src python -m fresh_simple_trading_project.cli trade-once --symbol AAPL
+PYTHONPATH=src python -m fresh_simple_trading_project.cli alpha-vantage-indicators --symbol AAPL
 PYTHONPATH=src python -m fresh_simple_trading_project.cli trade-loop --symbol AAPL --sleep-seconds 3600
 PYTHONPATH=src python -m fresh_simple_trading_project.cli backtest --symbol AAPL --sleep-seconds 1
 PYTHONPATH=src python -m fresh_simple_trading_project.cli trade-loop --symbol AAPL --sleep-seconds 1
 ```
 
 `trade-once` now prints the LLM agent handoffs and final decision rationale by default. Use `trade-once --json` if you want the structured JSON payload instead.
+
+`alpha-vantage-indicators` fetches the requested Alpha Vantage technical indicators on `5min` candles, aligns them on common timestamps, filters to the latest trading day, stores the JSON snapshot in the configured SQLite/Azure SQL result store, and prints the JSON table plus hourly chunks.
 
 `trade-loop` accepts `--sleep-seconds` so you can compress the wall-clock wait between hourly workflow iterations during demos or simulations while keeping the trading checkpoint cadence at one hour. Live mode defaults to `3600`.
 
@@ -79,6 +82,7 @@ Before using the CLI or `build_workflow()`, export:
 export DEEPSEEK_API_KEY=your_key
 export DEEPSEEK_BASE_URL=https://api.deepseek.com
 export DEEPSEEK_MODEL=deepseek-reasoner
+export ALPHA_VANTAGE_API_KEY=your_alpha_vantage_key
 ```
 
 To use the Alpaca setup pattern from the notebook, export:

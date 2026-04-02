@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -10,7 +10,7 @@ import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from .models import BacktestSummary, NewsArticle, WorkflowResult
+from .models import AlphaVantageIndicatorSnapshot, BacktestSummary, NewsArticle, WorkflowResult
 from .utils import timestamp_slug
 
 
@@ -45,6 +45,9 @@ class ResultStore(Protocol):
         ...
 
     def load_last_processed(self, symbol: str) -> pd.Timestamp | None:
+        ...
+
+    def save_alpha_vantage_indicator_snapshot(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
         ...
 
 
@@ -181,6 +184,7 @@ class InMemoryResultStore:
         self.backtest_runs: list[BacktestSummary] = []
         self.last_processed: dict[str, pd.Timestamp] = {}
         self.raw_artifacts_by_symbol: dict[str, dict[str, StorageRef]] = {}
+        self.alpha_vantage_indicator_snapshots: list[AlphaVantageIndicatorSnapshot] = []
 
     def save_workflow_run(
         self,
@@ -200,6 +204,9 @@ class InMemoryResultStore:
 
     def load_last_processed(self, symbol: str) -> pd.Timestamp | None:
         return self.last_processed.get(symbol)
+
+    def save_alpha_vantage_indicator_snapshot(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
+        self.alpha_vantage_indicator_snapshots.append(snapshot)
 
 
 class SQLAlchemyResultStore:
@@ -249,6 +256,19 @@ class SQLAlchemyResultStore:
             sa.Column("symbol", sa.String(32), primary_key=True),
             sa.Column("last_processed_at", sa.String(64), nullable=False),
         )
+        self.alpha_vantage_indicator_snapshots_table = sa.Table(
+            "alpha_vantage_indicator_snapshots",
+            self._metadata,
+            sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+            sa.Column("created_at", sa.String(32), nullable=False),
+            sa.Column("symbol", sa.String(32), nullable=False),
+            sa.Column("interval", sa.String(16), nullable=False),
+            sa.Column("trading_day", sa.String(16), nullable=False),
+            sa.Column("latest_timestamp", sa.String(32), nullable=False),
+            sa.Column("latest_hour_slot_start", sa.String(32), nullable=True),
+            sa.Column("latest_hour_slot_end", sa.String(32), nullable=True),
+            sa.Column("payload", sa.Text, nullable=False),
+        )
         create_engine = engine_factory or _default_sqlalchemy_engine_factory
         self.engine = create_engine(database_url)
         self._metadata.create_all(self.engine)
@@ -265,6 +285,7 @@ class SQLAlchemyResultStore:
             "analysis_notes": result.analysis.notes,
             "technical_agent_summary": result.analysis.llm_summary,
             "news_agent_summary": result.retrieval.summary_note,
+            "critical_news": result.retrieval.critical_news,
             "risk_warnings": result.risk.warnings,
             "risk_agent_summary": result.risk.summary_note,
             "headlines": result.retrieval.headline_summary,
@@ -279,6 +300,21 @@ class SQLAlchemyResultStore:
                     "content_type": artifact.content_type,
                 }
                 for name, artifact in raw_artifacts.items()
+            }
+        if result.alpha_vantage_indicator_snapshot is not None:
+            latest_hour_chunk = result.alpha_vantage_indicator_snapshot.latest_hour_chunk
+            metadata["alpha_vantage_indicator_snapshot"] = {
+                "trading_day": result.alpha_vantage_indicator_snapshot.trading_day,
+                "latest_timestamp": result.alpha_vantage_indicator_snapshot.latest_timestamp,
+                "indicator_columns": result.alpha_vantage_indicator_snapshot.indicator_columns,
+                "row_count": len(result.alpha_vantage_indicator_snapshot.rows),
+                "latest_hour_slot": None
+                if latest_hour_chunk is None
+                else {
+                    "slot_start": latest_hour_chunk.slot_start,
+                    "slot_end": latest_hour_chunk.slot_end,
+                    "row_count": len(latest_hour_chunk.rows),
+                },
             }
         with self.engine.begin() as connection:
             connection.execute(
@@ -339,6 +375,22 @@ class SQLAlchemyResultStore:
         if row is None or not row[0]:
             return None
         return pd.Timestamp(row[0])
+
+    def save_alpha_vantage_indicator_snapshot(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
+        latest_hour_chunk = snapshot.latest_hour_chunk
+        with self.engine.begin() as connection:
+            connection.execute(
+                sa.insert(self.alpha_vantage_indicator_snapshots_table).values(
+                    created_at=timestamp_slug(),
+                    symbol=snapshot.symbol,
+                    interval=snapshot.interval,
+                    trading_day=snapshot.trading_day,
+                    latest_timestamp=snapshot.latest_timestamp,
+                    latest_hour_slot_start=None if latest_hour_chunk is None else latest_hour_chunk.slot_start,
+                    latest_hour_slot_end=None if latest_hour_chunk is None else latest_hour_chunk.slot_end,
+                    payload=json.dumps(asdict(snapshot)),
+                )
+            )
 
 
 class SQLiteResultStore(SQLAlchemyResultStore):

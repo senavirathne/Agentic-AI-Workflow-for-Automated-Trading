@@ -45,6 +45,25 @@ class CollectedMarketData:
 
 
 @dataclass
+class IndicatorHourChunk:
+    slot_start: str
+    slot_end: str
+    rows: list[dict[str, object]]
+
+
+@dataclass
+class AlphaVantageIndicatorSnapshot:
+    symbol: str
+    interval: str
+    trading_day: str
+    latest_timestamp: str
+    indicator_columns: list[str]
+    rows: list[dict[str, object]]
+    hourly_chunks: list[IndicatorHourChunk] = field(default_factory=list)
+    latest_hour_chunk: IndicatorHourChunk | None = None
+
+
+@dataclass
 class EDAResult:
     symbol: str
     missing_values: int
@@ -87,7 +106,8 @@ class RetrievalResult:
     symbol: str
     articles: list[NewsArticle]
     headline_summary: list[str]
-    sentiment_score: float
+    sentiment_score: float = 0.0
+    critical_news: list[str] = field(default_factory=list)
     risk_flags: list[str] = field(default_factory=list)
     catalysts: list[str] = field(default_factory=list)
     summary_note: str | None = None
@@ -130,6 +150,7 @@ class WorkflowResult:
     risk: RiskResult
     decision: Decision
     execution: ExecutionResult
+    alpha_vantage_indicator_snapshot: AlphaVantageIndicatorSnapshot | None = None
 
 
 @dataclass

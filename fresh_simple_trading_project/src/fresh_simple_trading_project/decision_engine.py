@@ -37,13 +37,15 @@ class DecisionEngine:
     ) -> Decision:
         rationale = [
             f"Trend={analysis.trend}",
-            f"Sentiment={retrieval.sentiment_score:.2f}",
+            f"Critical news items={len(retrieval.critical_news)}",
             f"Risk score={risk.risk_score:.2f}",
         ]
         if analysis.llm_summary:
             rationale.append(f"Market analysis module: {analysis.llm_summary}")
         if retrieval.summary_note:
             rationale.append(f"Information retrieval module: {retrieval.summary_note}")
+        if retrieval.critical_news:
+            rationale.append(f"Top critical news: {retrieval.critical_news[0]}")
         if risk.summary_note:
             rationale.append(f"Risk analysis module: {risk.summary_note}")
         confidence = max(0.0, min(1.0, round((analysis.confidence + (1.0 - risk.risk_score)) / 2, 2)))
@@ -105,7 +107,6 @@ class DecisionEngine:
             account.position_qty == 0
             and analysis.entry_setup
             and risk.can_enter
-            and retrieval.sentiment_score >= -0.25
             and not near_resistance
         ):
             if in_support_region and confirmed_support_region and analysis.nearest_support_region is not None:
@@ -115,7 +116,7 @@ class DecisionEngine:
                 )
             elif analysis.nearest_support is not None:
                 rationale.append(f"Major support={analysis.nearest_support:.2f}.")
-            rationale.append("Entry setup, acceptable sentiment, and risk approval.")
+            rationale.append("Entry setup, news review completed, and risk approval.")
             return Decision(
                 symbol=analysis.symbol,
                 action=Action.BUY,

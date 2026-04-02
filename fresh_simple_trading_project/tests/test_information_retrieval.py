@@ -32,6 +32,16 @@ class RecordingLLM:
         return "Macro and market context summarized."
 
 
+class JSONRecordingLLM:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+        self.calls: list[tuple[str, str]] = []
+
+    def generate(self, system_prompt: str, content: str) -> str | None:
+        self.calls.append((system_prompt, content))
+        return self.payload
+
+
 class StubHTTPResponse:
     def __init__(self, payload: str) -> None:
         self._payload = payload.encode("utf-8")
@@ -252,3 +262,84 @@ def test_news_agent_prompt_mentions_macro_and_market_search_focus() -> None:
     assert "American economy developments" in prompt
     assert "overall U.S. stock market trend" in prompt
     assert "Queries used:" in prompt
+    assert "Rule-based sentiment score" not in prompt
+
+
+def test_news_agent_uses_structured_llm_output_for_critical_news() -> None:
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": [
+                NewsArticle(headline="AAPL supplier disruption may hit iPhone shipments", source="Symbol Wire")
+            ],
+            "American economy inflation interest rates jobs GDP Federal Reserve": [
+                NewsArticle(headline="Federal Reserve signals slower rate cuts", source="Macro Wire")
+            ],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [
+                NewsArticle(headline="Nasdaq breadth weakens despite index gains", source="Market Wire")
+            ],
+        }
+    )
+    llm = JSONRecordingLLM(
+        """
+        {
+          "summary_note": "Supply-chain pressure and a less dovish Fed are the key decision drivers.",
+          "critical_news": [
+            "AAPL supplier disruption could pressure near-term device shipments.",
+            "Federal Reserve commentary points to tighter financial conditions for longer."
+          ],
+          "risk_flags": [
+            "Supply-chain disruption risk remains active.",
+            "Macro policy remains restrictive."
+          ],
+          "catalysts": [
+            "Any resolution of supplier constraints would be positive."
+          ]
+        }
+        """
+    )
+    module = InformationRetrievalModule(client, llm_client=llm)
+
+    result = module.retrieve("AAPL", limit=6)
+
+    assert result.summary_note == "Supply-chain pressure and a less dovish Fed are the key decision drivers."
+    assert result.critical_news == [
+        "AAPL supplier disruption could pressure near-term device shipments.",
+        "Federal Reserve commentary points to tighter financial conditions for longer.",
+    ]
+    assert result.risk_flags == [
+        "Supply-chain disruption risk remains active.",
+        "Macro policy remains restrictive.",
+    ]
+    assert result.catalysts == ["Any resolution of supplier constraints would be positive."]
+    assert result.sentiment_score == 0.0
+
+
+def test_news_agent_fills_input_budget_with_older_articles() -> None:
+    recent = datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)
+    articles = [
+        NewsArticle(
+            headline=f"Article {index}",
+            summary="x" * 1500,
+            source="Wire",
+            published_at=(recent - timedelta(hours=index)).isoformat().replace("+00:00", "Z"),
+        )
+        for index in range(10)
+    ]
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": articles,
+            "American economy inflation interest rates jobs GDP Federal Reserve": [],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [],
+        }
+    )
+    llm = RecordingLLM()
+    module = InformationRetrievalModule(client, llm_client=llm)
+
+    result = module.retrieve("AAPL", limit=6)
+
+    _, prompt = llm.calls[-1]
+    assert "Article 0" in prompt
+    assert "Article 1" in prompt
+    assert "Article 6" in prompt
+    assert "Article 7" not in prompt
+    assert [article.headline for article in result.articles][:3] == ["Article 0", "Article 1", "Article 2"]

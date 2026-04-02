@@ -10,10 +10,12 @@ from fresh_simple_trading_project.config import Settings
 from fresh_simple_trading_project.models import (
     Action,
     AnalysisResult,
+    AlphaVantageIndicatorSnapshot,
     BacktestSummary,
     Decision,
     EDAResult,
     ExecutionResult,
+    IndicatorHourChunk,
     NewsArticle,
     RetrievalResult,
     RiskResult,
@@ -53,6 +55,7 @@ def test_sqlalchemy_result_store_persists_artifacts_and_state(tmp_path: Path) ->
         },
     )
     store.save_last_processed("AAPL", result.analysis.timestamp)
+    store.save_alpha_vantage_indicator_snapshot(_sample_alpha_vantage_snapshot())
     store.save_backtest_summary(
         BacktestSummary(
             symbol="AAPL",
@@ -74,8 +77,12 @@ def test_sqlalchemy_result_store_persists_artifacts_and_state(tmp_path: Path) ->
     with store.engine.begin() as connection:
         metadata_raw = connection.execute(sa.select(store.workflow_runs_table.c.metadata)).scalar_one()
         backtest_count = connection.execute(sa.select(sa.func.count()).select_from(store.backtest_runs_table)).scalar_one()
+        snapshot_count = connection.execute(
+            sa.select(sa.func.count()).select_from(store.alpha_vantage_indicator_snapshots_table)
+        ).scalar_one()
     metadata = json.loads(metadata_raw)
     assert metadata["raw_artifacts"]["five_minute_bars"]["uri"] == "file:///tmp/aapl_5min.csv"
+    assert snapshot_count == 1
     assert backtest_count == 1
 
 
@@ -173,6 +180,29 @@ def _sample_workflow_result() -> WorkflowResult:
             order_id=None,
             status="dry_run",
         ),
+        alpha_vantage_indicator_snapshot=_sample_alpha_vantage_snapshot(),
+    )
+
+
+def _sample_alpha_vantage_snapshot() -> AlphaVantageIndicatorSnapshot:
+    rows = [
+        {"time": "2025-01-01 11:00:00", "RSI": 52.0, "ADX": 23.5, "threshold_hits": ["ADX_STRONG_TREND"]},
+        {"time": "2025-01-01 11:05:00", "RSI": 72.0, "ADX": 28.0, "threshold_hits": ["RSI_OVERBOUGHT"]},
+    ]
+    latest_chunk = IndicatorHourChunk(
+        slot_start="2025-01-01 11:00:00",
+        slot_end="2025-01-01 11:05:00",
+        rows=rows,
+    )
+    return AlphaVantageIndicatorSnapshot(
+        symbol="AAPL",
+        interval="5min",
+        trading_day="2025-01-01",
+        latest_timestamp="2025-01-01 11:05:00",
+        indicator_columns=["RSI", "ADX"],
+        rows=rows,
+        hourly_chunks=[latest_chunk],
+        latest_hour_chunk=latest_chunk,
     )
 
 
