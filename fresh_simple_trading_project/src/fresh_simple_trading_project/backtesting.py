@@ -1,27 +1,81 @@
+"""Backtesting helpers for replaying the unified trading workflow."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import replace
+from pathlib import Path
 
 import pandas as pd
 
-from .config import RunMode
-from .models import Action, BacktestSummary, BacktestTrade, WorkflowResult
+from .config import (
+    AlpacaConfig,
+    AlphaVantageConfig,
+    AzureConfig,
+    LLMConfig,
+    MarketDataConfig,
+    NewsConfig,
+    Paths,
+    RawStoreConfig,
+    ResultStoreConfig,
+    RunMode,
+    Settings,
+    TradingConfig,
+)
+from .data_collection import DataCollectionModule, HistoricalReplayDataClient, SimulatedAccountClient
+from .decision_engine import DecisionEngine
+from .eda import EDAModule
+from .execution import ExecutionModule, InMemoryBrokerClient
+from .features import FeatureEngineeringModule
+from .market_analysis import MarketAnalysisModule
+from .models import Action, BacktestSummary, BacktestTrade, RetrievalResult, WorkflowResult
+from .risk_analysis import RiskAnalysisModule
+from .storage import InMemoryResultStore
 from .workflow import TradingWorkflow
 
 
-@dataclass
 class BacktestingEngine:
     """Thin wrapper over the unified workflow loop."""
 
-    workflow: TradingWorkflow
+    workflow: TradingWorkflow | None
+
+    def __init__(
+        self,
+        workflow: TradingWorkflow | None = None,
+        *,
+        config: TradingConfig | None = None,
+        feature_engineering: FeatureEngineeringModule | None = None,
+        eda_module: EDAModule | None = None,
+        market_analysis: MarketAnalysisModule | None = None,
+        risk_analysis: RiskAnalysisModule | None = None,
+        decision_engine: DecisionEngine | None = None,
+    ) -> None:
+        self.workflow = workflow
+        self._legacy_config = config
+        self._legacy_feature_engineering = feature_engineering
+        self._legacy_eda_module = eda_module
+        self._legacy_market_analysis = market_analysis
+        self._legacy_risk_analysis = risk_analysis
+        self._legacy_decision_engine = decision_engine
 
     def run(
         self,
         symbol: str | None = None,
+        five_minute_bars: pd.DataFrame | None = None,
+        hourly_bars: pd.DataFrame | None = None,
         *,
         max_iterations: int | None = None,
         sleep_seconds: float | None = None,
     ) -> BacktestSummary:
+        if five_minute_bars is not None:
+            return self._run_legacy(
+                symbol=symbol,
+                five_minute_bars=five_minute_bars,
+                hourly_bars=hourly_bars,
+                max_iterations=max_iterations,
+                sleep_seconds=sleep_seconds,
+            )
+        if self.workflow is None:
+            raise RuntimeError("BacktestingEngine requires either a workflow or explicit historical bars.")
         if self.workflow.settings.trading.mode != RunMode.BACKTEST:
             raise RuntimeError("BacktestingEngine requires a workflow configured with RunMode.BACKTEST.")
         results = self.workflow.run_loop(
@@ -36,6 +90,113 @@ class BacktestingEngine:
             symbol=(symbol or self.workflow.settings.trading.symbol).upper(),
         )
 
+    def _run_legacy(
+        self,
+        *,
+        symbol: str | None,
+        five_minute_bars: pd.DataFrame,
+        hourly_bars: pd.DataFrame | None,
+        max_iterations: int | None,
+        sleep_seconds: float | None,
+    ) -> BacktestSummary:
+        config = self._legacy_config
+        if (
+            config is None
+            or self._legacy_feature_engineering is None
+            or self._legacy_eda_module is None
+            or self._legacy_market_analysis is None
+            or self._legacy_risk_analysis is None
+            or self._legacy_decision_engine is None
+        ):
+            raise RuntimeError("Legacy BacktestingEngine usage requires config and workflow modules.")
+
+        target_symbol = (symbol or config.symbol).upper()
+        isolated_root = Path("/tmp/fresh_simple_trading_project_backtesting")
+        isolated_root.mkdir(parents=True, exist_ok=True)
+        paths = Paths(
+            project_root=isolated_root,
+            data_dir=isolated_root / "data",
+            raw_dir=isolated_root / "data" / "raw",
+            reports_dir=isolated_root / "reports",
+            database_path=isolated_root / "data" / "workflow.sqlite",
+        )
+        paths.create_directories()
+        settings = Settings(
+            trading=replace(config, mode=RunMode.BACKTEST),
+            market_data=MarketDataConfig(provider="alpha_vantage"),
+            raw_store=RawStoreConfig(provider="local"),
+            result_store=ResultStoreConfig(provider="sqlite", database_url=f"sqlite:///{paths.database_path.resolve()}"),
+            alpha_vantage=AlphaVantageConfig(),
+            azure=AzureConfig(),
+            alpaca=AlpacaConfig(),
+            news=NewsConfig(),
+            llm=LLMConfig(),
+            secondary_llm=None,
+            paths=paths,
+        )
+        simulated_account = SimulatedAccountClient(cash=config.starting_cash)
+        replay_client = HistoricalReplayDataClient(
+            five_min_history=five_minute_bars,
+            hourly_history=hourly_bars if hourly_bars is not None else pd.DataFrame(),
+        )
+        workflow = TradingWorkflow(
+            settings=settings,
+            data_collection=DataCollectionModule(
+                market_data_client=replay_client,
+                account_client=simulated_account,
+            ),
+            eda_module=self._legacy_eda_module,
+            feature_engineering=self._legacy_feature_engineering,
+            market_analysis=self._legacy_market_analysis,
+            information_retrieval=_BacktestRetrievalModule(),
+            risk_analysis=self._legacy_risk_analysis,
+            decision_engine=self._legacy_decision_engine,
+            execution_module=ExecutionModule(InMemoryBrokerClient(account_client=simulated_account)),
+            raw_store=_NullRawStore(),
+            result_store=InMemoryResultStore(),
+            default_sleep_seconds=0.0,
+        )
+        results = workflow.run_loop(
+            symbol=target_symbol,
+            execute_orders=True,
+            max_iterations=max_iterations,
+            sleep_seconds=sleep_seconds,
+        )
+        return summarize_backtest_results(
+            results,
+            starting_cash=config.starting_cash,
+            symbol=target_symbol,
+        )
+
+
+class _NullRawStore:
+    """Minimal raw-store stub used by the legacy backtesting path."""
+
+    def save_bars(self, symbol: str, timeframe: str, bars: pd.DataFrame) -> Path:
+        return Path("/tmp")
+
+    def save_news(self, symbol: str, articles) -> Path:
+        return Path("/tmp")
+
+
+class _BacktestRetrievalModule:
+    """Static retrieval stub used by the legacy backtesting path."""
+
+    def retrieve(
+        self,
+        symbol: str,
+        limit: int = 8,
+        *,
+        input_size_chars: int | None = None,
+        published_at_lte=None,
+    ) -> RetrievalResult:
+        return RetrievalResult(
+            symbol=symbol,
+            articles=[],
+            headline_summary=[],
+            sentiment_score=0.0,
+        )
+
 
 def summarize_backtest_results(
     results: list[WorkflowResult],
@@ -43,6 +204,7 @@ def summarize_backtest_results(
     starting_cash: float,
     symbol: str | None = None,
 ) -> BacktestSummary:
+    """Aggregate workflow iteration results into a backtest summary."""
     target_symbol = (symbol or (results[0].symbol if results else "")).upper()
     if not results:
         return BacktestSummary(
@@ -58,6 +220,7 @@ def summarize_backtest_results(
             signal_accuracy=0.0,
             trades=[],
             equity_curve=pd.DataFrame(columns=["equity"]),
+            net_profit=0.0,
         )
 
     cash = float(starting_cash)
@@ -137,6 +300,7 @@ def summarize_backtest_results(
     sharpe_ratio = _sharpe_ratio(equity_curve["equity"])
     trade_count = len(trades)
     win_rate = round(sum(trade.pnl > 0 for trade in trades) / trade_count, 2) if trade_count else 0.0
+    net_profit = round(ending_cash - starting_cash, 2)
 
     return BacktestSummary(
         symbol=target_symbol,
@@ -151,6 +315,7 @@ def summarize_backtest_results(
         signal_accuracy=win_rate,
         trades=trades,
         equity_curve=equity_curve,
+        net_profit=net_profit,
     )
 
 

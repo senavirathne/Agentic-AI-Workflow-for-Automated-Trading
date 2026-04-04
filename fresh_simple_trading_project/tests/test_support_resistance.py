@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from fresh_simple_trading_project.agents import DecisionCoordinatorAgent
 from fresh_simple_trading_project.config import Settings
 from fresh_simple_trading_project.decision_engine import DecisionEngine
 from fresh_simple_trading_project.features import FeatureEngineeringModule
@@ -123,7 +124,11 @@ def test_decision_engine_sells_when_price_breaks_below_support_region() -> None:
 
 
 def test_decision_engine_can_use_llm_review_without_changing_simple_module_flow() -> None:
-    engine = DecisionEngine(llm_client=StubLLM(["OVERRIDE=HOLD\nNOTE=Wait for a cleaner entry above resistance."]))
+    engine = DecisionEngine(
+        decision_agent=DecisionCoordinatorAgent(
+            llm_client=StubLLM(["OVERRIDE=HOLD\nNOTE=Wait for a cleaner entry above resistance."])
+        )
+    )
     analysis = AnalysisResult(
         symbol="AAPL",
         timestamp=pd.Timestamp("2025-01-01T12:00:00Z"),

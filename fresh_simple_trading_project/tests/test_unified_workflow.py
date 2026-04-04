@@ -11,7 +11,6 @@ from fresh_simple_trading_project.data_collection import (
     DataCollectionModule,
     HistoricalReplayDataClient,
     SimulatedAccountClient,
-    SyntheticMarketDataClient,
 )
 from fresh_simple_trading_project.decision_engine import DecisionEngine
 from fresh_simple_trading_project.eda import EDAModule
@@ -33,7 +32,14 @@ class DummyRawStore:
 
 
 class DummyInformationRetrieval:
-    def retrieve(self, symbol: str, limit: int = 8) -> RetrievalResult:
+    def retrieve(
+        self,
+        symbol: str,
+        limit: int = 8,
+        *,
+        input_size_chars: int | None = None,
+        published_at_lte=None,
+    ) -> RetrievalResult:
         return RetrievalResult(symbol=symbol, articles=[], headline_summary=[], sentiment_score=0.0)
 
 
@@ -66,10 +72,9 @@ def test_backtest_run_loop_uses_explicit_windows(monkeypatch: pytest.MonkeyPatch
     settings = Settings.from_env(project_root=project_root)
     settings = replace(settings, trading=replace(settings.trading, mode=RunMode.BACKTEST))
 
-    synthetic_client = SyntheticMarketDataClient(periods=3_000)
     replay_client = HistoricalReplayDataClient(
-        five_min_history=synthetic_client.fetch_five_minute_bars("AAPL"),
-        hourly_history=synthetic_client.fetch_hourly_bars("AAPL"),
+        five_min_history=_make_replay_bars(),
+        hourly_history=pd.DataFrame(),
     )
     account_client = SimulatedAccountClient(cash=settings.trading.starting_cash)
     broker_client = InMemoryBrokerClient(account_client=account_client)
@@ -99,3 +104,18 @@ def test_backtest_run_loop_uses_explicit_windows(monkeypatch: pytest.MonkeyPatch
             result.five_minute_bars.index.max() - result.five_minute_bars.index.min()
         ) == pd.Timedelta(hours=24)
         assert (result.hourly_bars.index.max() - result.hourly_bars.index.min()) == pd.Timedelta(days=7)
+
+
+def _make_replay_bars() -> pd.DataFrame:
+    index = pd.date_range("2025-01-01", periods=3_000, freq="5min", tz="UTC")
+    close = pd.Series(range(len(index)), dtype="float64").mul(0.02).add(100.0).to_numpy()
+    return pd.DataFrame(
+        {
+            "open": close - 0.25,
+            "high": close + 0.5,
+            "low": close - 0.5,
+            "close": close,
+            "volume": 50_000,
+        },
+        index=index,
+    )

@@ -1,3 +1,5 @@
+"""Feature engineering for 5-minute trading bars."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,9 +11,12 @@ from .config import TradingConfig
 
 @dataclass
 class FeatureEngineeringModule:
+    """Compute technical features and rule-based buy/sell triggers."""
+
     config: TradingConfig
 
     def build(self, bars: pd.DataFrame) -> pd.DataFrame:
+        """Create indicator columns used by analysis and decision modules."""
         frame = bars.copy().sort_index()
         frame["return"] = frame["close"].pct_change()
         frame["ma_short"] = frame["close"].rolling(self.config.short_ma, min_periods=1).mean()
@@ -40,6 +45,7 @@ class FeatureEngineeringModule:
 
 
 def _compute_rsi(close: pd.Series, period: int) -> pd.Series:
+    """Compute a simple rolling RSI series."""
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(period, min_periods=1).mean()
     loss = (-delta.clip(upper=0)).rolling(period, min_periods=1).mean()
@@ -51,6 +57,7 @@ def _compute_rsi(close: pd.Series, period: int) -> pd.Series:
 
 
 def _compute_macd(close: pd.Series, fast: int, slow: int, signal: int) -> tuple[pd.Series, pd.Series]:
+    """Compute MACD and MACD signal series from closing prices."""
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd = ema_fast - ema_slow

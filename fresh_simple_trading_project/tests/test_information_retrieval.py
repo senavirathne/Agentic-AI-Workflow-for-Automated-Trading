@@ -4,13 +4,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import fresh_simple_trading_project.information_retrieval as information_retrieval_module
+from fresh_simple_trading_project.agents import NewsResearchAgent
 from fresh_simple_trading_project.information_retrieval import (
-    AlpacaNewsSearchClient,
+    AlphaVantageNewsSearchClient,
     CombinedNewsSearchClient,
     InformationRetrievalModule,
     WebSearchNewsClient,
 )
 from fresh_simple_trading_project.models import NewsArticle
+from fresh_simple_trading_project.storage import InMemoryResultStore
 
 
 @dataclass
@@ -18,7 +20,8 @@ class RecordingNewsSearchClient:
     responses: dict[str, list[NewsArticle]]
     calls: list[tuple[str, int]] = field(default_factory=list)
 
-    def search_news(self, query: str, limit: int = 10) -> list[NewsArticle]:
+    def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
+        del input_size_chars
         self.calls.append((query, limit))
         return list(self.responses.get(query, []))
 
@@ -56,28 +59,15 @@ class StubHTTPResponse:
         return None
 
 
-@dataclass
-class StubAlpacaService:
-    responses_by_symbols: dict[str | None, list[NewsArticle]]
-    calls: list[tuple[str | None, int, int]] = field(default_factory=list)
+class FakeAlphaVantageResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
 
-    def fetch_news(
-        self,
-        *,
-        symbols: str | list[str] | None = None,
-        days: int = 7,
-        limit: int = 10,
-    ) -> list[NewsArticle]:
-        if isinstance(symbols, list):
-            key = ",".join(symbols)
-        else:
-            key = symbols
-        self.calls.append((key, days, limit))
-        return list(self.responses_by_symbols.get(key, []))
+    def raise_for_status(self) -> None:
+        return None
 
-    def fetch_recent_news(self, symbol: str, days: int = 7, limit: int = 10) -> list[NewsArticle]:
-        self.calls.append((symbol, days, limit))
-        return list(self.responses_by_symbols.get(symbol, []))
+    def json(self) -> dict:
+        return self.payload
 
 
 def test_retrieve_searches_symbol_macro_and_market_queries() -> None:
@@ -108,7 +98,7 @@ def test_retrieve_searches_symbol_macro_and_market_queries() -> None:
     ]
 
 
-def test_retrieve_excludes_articles_older_than_one_week() -> None:
+def test_retrieve_keeps_recent_articles_first_when_older_history_exists() -> None:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     recent = (now - timedelta(days=2)).isoformat().replace("+00:00", "Z")
     stale = (now - timedelta(days=9)).isoformat().replace("+00:00", "Z")
@@ -132,8 +122,14 @@ def test_retrieve_excludes_articles_older_than_one_week() -> None:
 
     result = module.retrieve("AAPL", limit=6)
 
-    assert result.headline_summary == ["Fresh AAPL article remains eligible"]
-    assert [article.headline for article in result.articles] == ["Fresh AAPL article remains eligible"]
+    assert result.headline_summary == [
+        "Fresh AAPL article remains eligible",
+        "Stale AAPL article should be ignored",
+    ]
+    assert [article.headline for article in result.articles] == [
+        "Fresh AAPL article remains eligible",
+        "Stale AAPL article should be ignored",
+    ]
 
 
 def test_combined_news_client_merges_live_and_static_results_without_duplicates() -> None:
@@ -184,32 +180,80 @@ def test_combined_news_client_merges_live_and_static_results_without_duplicates(
     ]
 
 
-def test_alpaca_news_client_uses_alpaca_for_symbol_macro_and_market_scopes() -> None:
-    recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    service = StubAlpacaService(
-        {
-            "AAPL": [NewsArticle(headline="AAPL beats earnings estimates", source="Benzinga", published_at=recent)],
-            None: [
-                NewsArticle(headline="American economy cools as inflation slows", source="Benzinga", published_at=recent),
-                NewsArticle(headline="Unrelated company acquisition headline", source="Benzinga", published_at=recent),
-            ],
-            "SPY,QQQ,DIA,IWM": [
-                NewsArticle(headline="S&P 500 and Nasdaq extend stock market rally", source="Benzinga", published_at=recent),
-            ],
-        }
-    )
-    client = AlpacaNewsSearchClient(service, max_age_days=7)
+def test_alpha_vantage_news_client_uses_tickers_topics_and_dynamic_limit_without_time_from() -> None:
+    calls: list[dict] = []
 
-    symbol_articles = client.search_news("AAPL stock market news", limit=5)
-    macro_articles = client.search_news("American economy inflation interest rates jobs GDP Federal Reserve", limit=5)
-    market_articles = client.search_news("overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth", limit=5)
+    def fake_http_get(_url: str, *, params: dict, timeout: int) -> FakeAlphaVantageResponse:
+        del timeout
+        calls.append(dict(params))
+        if params.get("tickers") == "AAPL":
+            feed = [
+                {
+                    "title": "AAPL beats earnings estimates",
+                    "summary": "AAPL reports strong quarterly results.",
+                    "source": "Alpha Wire",
+                    "url": "https://example.com/aapl",
+                    "time_published": "20260402T013000",
+                    "ticker_sentiment": [
+                        {"ticker": "MSFT", "relevance_score": "0.41"},
+                        {"ticker": "AAPL", "relevance_score": "0.87"},
+                    ],
+                }
+            ]
+        elif params.get("topics") == "financial_markets":
+            feed = [
+                {
+                    "title": "S&P 500 extends market rally",
+                    "summary": "Broad market strength continues.",
+                    "source": "Alpha Wire",
+                    "url": "https://example.com/market",
+                    "time_published": "20260402T020000",
+                }
+            ]
+        else:
+            feed = [
+                {
+                    "title": "Federal Reserve holds rates steady",
+                    "summary": "Macro policy remains restrictive.",
+                    "source": "Alpha Wire",
+                    "url": "https://example.com/macro",
+                    "time_published": "20260402T021500",
+                }
+            ]
+        return FakeAlphaVantageResponse({"feed": feed})
+
+    client = AlphaVantageNewsSearchClient(
+        api_key="ABCDEFGHI1234",
+        max_age_days=7,
+        http_get=fake_http_get,
+    )
+
+    symbol_articles = client.search_news("AAPL stock market news", limit=5, input_size_chars=12_000)
+    macro_articles = client.search_news(
+        "American economy inflation interest rates jobs GDP Federal Reserve",
+        limit=5,
+        input_size_chars=12_000,
+    )
+    market_articles = client.search_news(
+        "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth",
+        limit=5,
+        input_size_chars=4_000,
+    )
 
     assert [article.headline for article in symbol_articles] == ["AAPL beats earnings estimates"]
-    assert [article.headline for article in macro_articles] == ["American economy cools as inflation slows"]
-    assert [article.headline for article in market_articles] == ["S&P 500 and Nasdaq extend stock market rally"]
-    assert service.calls[0] == ("AAPL", 7, 5)
-    assert service.calls[1] == (None, 7, 25)
-    assert service.calls[2] == ("SPY,QQQ,DIA,IWM", 7, 25)
+    assert [article.headline for article in macro_articles] == ["Federal Reserve holds rates steady"]
+    assert [article.headline for article in market_articles] == ["S&P 500 extends market rally"]
+    assert symbol_articles[0].provider == "alpha_vantage"
+    assert symbol_articles[0].primary_ticker == "AAPL"
+    assert symbol_articles[0].primary_ticker_relevance == 0.87
+    assert macro_articles[0].primary_ticker is None
+    assert calls[0]["tickers"] == "AAPL"
+    assert calls[1]["topics"] == "economy_macro,economy_monetary,economy_fiscal"
+    assert calls[2]["topics"] == "financial_markets"
+    assert "time_from" not in calls[0]
+    assert "time_from" not in calls[1]
+    assert "time_from" not in calls[2]
+    assert calls[0]["limit"] > calls[2]["limit"]
 
 
 def test_web_search_news_client_parses_live_search_feed(monkeypatch) -> None:
@@ -253,7 +297,7 @@ def test_news_agent_prompt_mentions_macro_and_market_search_focus() -> None:
         }
     )
     llm = RecordingLLM()
-    module = InformationRetrievalModule(client, llm_client=llm)
+    module = InformationRetrievalModule(client, news_agent=NewsResearchAgent(llm_client=llm))
 
     result = module.retrieve("AAPL", limit=6)
 
@@ -297,7 +341,7 @@ def test_news_agent_uses_structured_llm_output_for_critical_news() -> None:
         }
         """
     )
-    module = InformationRetrievalModule(client, llm_client=llm)
+    module = InformationRetrievalModule(client, news_agent=NewsResearchAgent(llm_client=llm))
 
     result = module.retrieve("AAPL", limit=6)
 
@@ -306,12 +350,50 @@ def test_news_agent_uses_structured_llm_output_for_critical_news() -> None:
         "AAPL supplier disruption could pressure near-term device shipments.",
         "Federal Reserve commentary points to tighter financial conditions for longer.",
     ]
+    assert result.headline_summary == result.critical_news
     assert result.risk_flags == [
         "Supply-chain disruption risk remains active.",
         "Macro policy remains restrictive.",
     ]
     assert result.catalysts == ["Any resolution of supplier constraints would be positive."]
     assert result.sentiment_score == 0.0
+
+
+def test_news_agent_output_is_capped_to_three_compressed_critical_items() -> None:
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": [NewsArticle(headline="AAPL article", source="Symbol Wire")],
+            "American economy inflation interest rates jobs GDP Federal Reserve": [
+                NewsArticle(headline="Economy article", source="Macro Wire")
+            ],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [
+                NewsArticle(headline="Market article", source="Market Wire")
+            ],
+        }
+    )
+    llm = JSONRecordingLLM(
+        """
+        {
+          "summary_note": "A very long summary that should still remain concise after compression because the retrieval layer now enforces a hard bound on the news handoff size before it reaches the decision agent.",
+          "critical_news": [
+            "AAPL: exceptionally long symbol-specific critical news item that should be trimmed because it is much longer than the compact format required for the decision-making agent to consume efficiently.",
+            "Economy: exceptionally long macroeconomic critical news item that should also be trimmed because the news handoff must stay compact and precise.",
+            "Market: exceptionally long stock-market critical news item that should also be trimmed for the same reason.",
+            "Extra item that should be dropped entirely."
+          ],
+          "risk_flags": [],
+          "catalysts": []
+        }
+        """
+    )
+    module = InformationRetrievalModule(client, news_agent=NewsResearchAgent(llm_client=llm))
+
+    result = module.retrieve("AAPL", limit=6)
+
+    assert len(result.critical_news) == 3
+    assert all(len(item) <= 180 for item in result.critical_news)
+    assert len(result.summary_note or "") <= 320
+    assert result.headline_summary == result.critical_news
 
 
 def test_news_agent_fills_input_budget_with_older_articles() -> None:
@@ -333,7 +415,7 @@ def test_news_agent_fills_input_budget_with_older_articles() -> None:
         }
     )
     llm = RecordingLLM()
-    module = InformationRetrievalModule(client, llm_client=llm)
+    module = InformationRetrievalModule(client, news_agent=NewsResearchAgent(llm_client=llm))
 
     result = module.retrieve("AAPL", limit=6)
 
@@ -343,3 +425,177 @@ def test_news_agent_fills_input_budget_with_older_articles() -> None:
     assert "Article 6" in prompt
     assert "Article 7" not in prompt
     assert [article.headline for article in result.articles][:3] == ["Article 0", "Article 1", "Article 2"]
+
+
+def test_retrieve_uses_cached_news_history_to_fill_input_budget() -> None:
+    recent = datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)
+    archive = InMemoryResultStore()
+    archive.save_retrieved_news(
+        "AAPL",
+        "AAPL stock market news",
+        [
+            NewsArticle(
+                headline=f"Cached article {index}",
+                summary="y" * 1200,
+                source="Archive Wire",
+                published_at=(recent - timedelta(hours=index + 1)).isoformat().replace("+00:00", "Z"),
+            )
+            for index in range(4)
+        ],
+    )
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": [
+                NewsArticle(
+                    headline="Live article",
+                    summary="z" * 1200,
+                    source="Live Wire",
+                    published_at=recent.isoformat().replace("+00:00", "Z"),
+                )
+            ],
+            "American economy inflation interest rates jobs GDP Federal Reserve": [],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [],
+        }
+    )
+    llm = RecordingLLM()
+    module = InformationRetrievalModule(
+        client,
+        news_agent=NewsResearchAgent(llm_client=llm),
+        news_archive=archive,
+    )
+
+    result = module.retrieve("AAPL", limit=6, input_size_chars=4_000)
+
+    _, prompt = llm.calls[-1]
+    assert "Live article" in prompt
+    assert "Cached article 0" in prompt
+    assert "Cached article 1" in prompt
+    assert [article.headline for article in result.articles][:3] == [
+        "Live article",
+        "Cached article 0",
+        "Cached article 1",
+    ]
+
+
+def test_retrieve_filters_cached_alpha_vantage_news_to_target_primary_ticker() -> None:
+    recent = datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)
+    archive = InMemoryResultStore()
+    archive.save_retrieved_news(
+        "AAPL",
+        "AAPL stock market news",
+        [
+            NewsArticle(
+                headline="AAPL primary article",
+                summary="AAPL-specific update",
+                source="Alpha Wire",
+                url="https://example.com/aapl-primary",
+                published_at=recent.isoformat().replace("+00:00", "Z"),
+                provider="alpha_vantage",
+                primary_ticker="AAPL",
+                primary_ticker_relevance=0.92,
+            ),
+            NewsArticle(
+                headline="MSFT primary article",
+                summary="Cross-ticker article that should be removed",
+                source="Alpha Wire",
+                url="https://example.com/msft-primary",
+                published_at=(recent - timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                provider="alpha_vantage",
+                primary_ticker="MSFT",
+                primary_ticker_relevance=0.95,
+            ),
+            NewsArticle(
+                headline="Web market fallback",
+                summary="Broad market context should remain available.",
+                source="Market Wire",
+                url="https://example.com/web-market",
+                published_at=(recent - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                provider="web_search",
+            ),
+        ],
+    )
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": [],
+            "American economy inflation interest rates jobs GDP Federal Reserve": [],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [],
+        }
+    )
+    llm = RecordingLLM()
+    module = InformationRetrievalModule(
+        client,
+        news_agent=NewsResearchAgent(llm_client=llm),
+        news_archive=archive,
+    )
+
+    result = module.retrieve("AAPL", limit=6, input_size_chars=4_000)
+
+    _, prompt = llm.calls[-1]
+    assert "AAPL primary article" in prompt
+    assert "MSFT primary article" not in prompt
+    assert "Web market fallback" in prompt
+    assert [article.headline for article in result.articles] == [
+        "AAPL primary article",
+        "Web market fallback",
+    ]
+
+
+def test_retrieve_filters_articles_to_backtest_news_cutoff() -> None:
+    cutoff = "2026-04-01T20:00:00Z"
+    archive = InMemoryResultStore()
+    archive.save_retrieved_news(
+        "AAPL",
+        "AAPL stock market news",
+        [
+            NewsArticle(
+                headline="Cached article before cutoff",
+                summary="Eligible cached context.",
+                source="Archive Wire",
+                published_at="2026-04-01T19:30:00Z",
+            ),
+            NewsArticle(
+                headline="Cached article after cutoff",
+                summary="Should be excluded from the backtest prompt.",
+                source="Archive Wire",
+                published_at="2026-04-01T21:30:00Z",
+            ),
+        ],
+    )
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": [
+                NewsArticle(
+                    headline="Live article after cutoff",
+                    summary="Should not be used.",
+                    source="Live Wire",
+                    published_at="2026-04-01T22:00:00Z",
+                ),
+                NewsArticle(
+                    headline="Live article before cutoff",
+                    summary="Still eligible.",
+                    source="Live Wire",
+                    published_at="2026-04-01T18:00:00Z",
+                ),
+            ],
+            "American economy inflation interest rates jobs GDP Federal Reserve": [],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [],
+        }
+    )
+    llm = RecordingLLM()
+    module = InformationRetrievalModule(
+        client,
+        news_agent=NewsResearchAgent(llm_client=llm),
+        news_archive=archive,
+    )
+
+    result = module.retrieve("AAPL", limit=6, published_at_lte=cutoff)
+
+    _, prompt = llm.calls[-1]
+    assert "Cached article before cutoff" in prompt
+    assert "Live article before cutoff" in prompt
+    assert "Cached article after cutoff" not in prompt
+    assert "Live article after cutoff" not in prompt
+    assert [article.headline for article in result.articles] == [
+        "Cached article before cutoff",
+        "Live article before cutoff",
+    ]

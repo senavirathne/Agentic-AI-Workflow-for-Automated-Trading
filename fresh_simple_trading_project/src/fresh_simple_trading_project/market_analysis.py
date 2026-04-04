@@ -1,3 +1,5 @@
+"""Technical market analysis built from engineered features and price levels."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,19 +8,16 @@ import pandas as pd
 
 from .agents import TechnicalAnalysisAgent
 from .config import TradingConfig
-from .llm import TextGenerationClient
-from .models import AlphaVantageIndicatorSnapshot, AnalysisResult
+from .models import AlphaVantageIndicatorSnapshot, AnalysisResult, ForecastSnapshot, PriceLevelContext
+from .utils import _as_utc_timestamp, _format_region, _region_midpoint
 
 
 @dataclass
 class MarketAnalysisModule:
-    config: TradingConfig
-    llm_client: TextGenerationClient | None = None
-    technical_agent: TechnicalAnalysisAgent | None = None
+    """Create the technical analysis snapshot used by later workflow stages."""
 
-    def __post_init__(self) -> None:
-        if self.technical_agent is None and self.llm_client is not None:
-            self.technical_agent = TechnicalAnalysisAgent(llm_client=self.llm_client)
+    config: TradingConfig
+    technical_agent: TechnicalAnalysisAgent | None = None
 
     def analyze(
         self,
@@ -26,13 +25,19 @@ class MarketAnalysisModule:
         feature_frame: pd.DataFrame,
         hourly_bars: pd.DataFrame | None = None,
         alpha_vantage_snapshot: AlphaVantageIndicatorSnapshot | None = None,
+        price_at_timestamp: float | None = None,
+        current_price: float | None = None,
+        market_data_delay_minutes: int = 0,
+        indicator_source: str = "manually computed indicators from 5-minute bar data",
+        previous_forecast: ForecastSnapshot | None = None,
     ) -> AnalysisResult:
         latest = feature_frame.iloc[-1]
         analysis_timestamp = _as_utc_timestamp(feature_frame.index[-1])
         major_frame = hourly_bars if hourly_bars is not None and not hourly_bars.empty else feature_frame
         support_levels, _, resistance_levels, _ = _identify_price_levels(major_frame)
         local_support_levels, local_support_strengths, local_resistance_levels, local_resistance_strengths = _identify_price_levels(feature_frame)
-        latest_price = float(latest["close"])
+        latest_price = float(price_at_timestamp if price_at_timestamp is not None else latest["close"])
+        latest_volume = float(latest.get("volume", 0.0))
         region_half_width_pct = _region_half_width_pct(feature_frame)
         support_regions = _build_regions(local_support_levels, region_half_width_pct)
         resistance_regions = _build_regions(local_resistance_levels, region_half_width_pct)
@@ -65,7 +70,7 @@ class MarketAnalysisModule:
             confidence += 0.1
         confidence = max(0.0, min(1.0, round(confidence, 2)))
         notes = [
-            "Signal computed from 5-minute candlestick data.",
+            f"Signal computed from {indicator_source}.",
             "Major support and resistance lines are derived from hourly pivot candles.",
             "Local support and resistance regions are derived from 5-minute pivot candles and recent candle ranges.",
             f"Latest close={latest_price:.2f}",
@@ -73,6 +78,12 @@ class MarketAnalysisModule:
             f"MACD={float(latest['macd']):.4f} vs signal={float(latest['macd_signal']):.4f}",
             f"Trend={trend}",
         ]
+        if market_data_delay_minutes > 0:
+            notes.append(
+                f"Live trading uses {market_data_delay_minutes}-minute delayed candle data for indicators and levels."
+            )
+        if current_price is not None:
+            notes.append(f"Current live price snapshot={current_price:.2f}.")
         if nearest_support is not None:
             notes.append(f"Major support={nearest_support:.2f} ({distance_to_support_pct:.2f}% away).")
         if nearest_support_region is not None:
@@ -89,6 +100,9 @@ class MarketAnalysisModule:
                 + _format_region(nearest_resistance_region)
                 + f" (historical touches={nearest_resistance_region_strength})."
             )
+        previous_forecast_summary = _previous_forecast_summary(previous_forecast, latest_price, latest_volume)
+        if previous_forecast_summary is not None:
+            notes.append(previous_forecast_summary)
         llm_summary = self._summarize_with_llm(
             symbol=symbol,
             analysis_timestamp=analysis_timestamp,
@@ -100,6 +114,10 @@ class MarketAnalysisModule:
             local_support_region=nearest_support_region,
             local_resistance_region=nearest_resistance_region,
             alpha_vantage_snapshot=alpha_vantage_snapshot,
+            current_price=current_price,
+            market_data_delay_minutes=market_data_delay_minutes,
+            indicator_source=indicator_source,
+            previous_forecast=previous_forecast,
         )
         if alpha_vantage_snapshot is not None:
             notes.append(
@@ -114,16 +132,7 @@ class MarketAnalysisModule:
                 )
         if llm_summary:
             notes.append(f"LLM technical summary: {llm_summary}")
-        return AnalysisResult(
-            symbol=symbol,
-            timestamp=analysis_timestamp,
-            latest_price=latest_price,
-            trend=trend,
-            bullish=bullish,
-            entry_setup=entry_setup,
-            exit_setup=exit_setup,
-            confidence=confidence,
-            notes=notes,
+        price_levels = PriceLevelContext(
             support_levels=support_levels,
             resistance_levels=resistance_levels,
             support_regions=support_regions,
@@ -138,7 +147,24 @@ class MarketAnalysisModule:
             nearest_resistance_region_strength=nearest_resistance_region_strength,
             distance_to_support_pct=distance_to_support_pct,
             distance_to_resistance_pct=distance_to_resistance_pct,
+        )
+        return AnalysisResult(
+            symbol=symbol,
+            timestamp=analysis_timestamp,
+            latest_price=latest_price,
+            trend=trend,
+            bullish=bullish,
+            entry_setup=entry_setup,
+            exit_setup=exit_setup,
+            confidence=confidence,
+            notes=notes,
+            price_levels=price_levels,
             llm_summary=llm_summary,
+            current_price=current_price,
+            market_data_delay_minutes=market_data_delay_minutes,
+            indicator_source=indicator_source,
+            latest_volume=latest_volume,
+            previous_forecast_summary=previous_forecast_summary,
         )
 
     def _summarize_with_llm(
@@ -154,6 +180,10 @@ class MarketAnalysisModule:
         local_support_region: tuple[float, float] | None,
         local_resistance_region: tuple[float, float] | None,
         alpha_vantage_snapshot: AlphaVantageIndicatorSnapshot | None,
+        current_price: float | None,
+        market_data_delay_minutes: int,
+        indicator_source: str,
+        previous_forecast: ForecastSnapshot | None,
     ) -> str | None:
         if self.technical_agent is None:
             return None
@@ -176,14 +206,45 @@ class MarketAnalysisModule:
             local_resistance_region=local_resistance_region,
             alpha_vantage_latest_hour_chunk=latest_hour_chunk,
             alpha_vantage_threshold_hits=_latest_chunk_threshold_hits(alpha_vantage_snapshot),
+            current_price=current_price,
+            market_data_delay_minutes=market_data_delay_minutes,
+            indicator_source=indicator_source,
+            previous_forecast=previous_forecast,
         )
 
 
-def _as_utc_timestamp(value: object) -> pd.Timestamp:
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        return timestamp.tz_localize("UTC")
-    return timestamp.tz_convert("UTC")
+def _previous_forecast_summary(
+    previous_forecast: ForecastSnapshot | None,
+    latest_price: float,
+    latest_volume: float,
+) -> str | None:
+    if previous_forecast is None:
+        return None
+    continuation_hit = (
+        previous_forecast.continuation_price_target is not None
+        and latest_price >= previous_forecast.continuation_price_target
+    )
+    continuation_volume_hit = (
+        previous_forecast.continuation_volume_target is not None
+        and latest_volume >= previous_forecast.continuation_volume_target
+    )
+    reversal_hit = (
+        previous_forecast.reversal_price_target is not None
+        and latest_price <= previous_forecast.reversal_price_target
+    )
+    reversal_volume_hit = (
+        previous_forecast.reversal_volume_target is not None
+        and latest_volume >= previous_forecast.reversal_volume_target
+    )
+    if continuation_hit and continuation_volume_hit:
+        return "Previous HOLD forecast continuation target and volume target have both been met."
+    if reversal_hit and reversal_volume_hit:
+        return "Previous HOLD forecast reversal target and reversal volume warning have both been triggered."
+    return (
+        "Previous HOLD forecast is still in play: "
+        f"continuation target={previous_forecast.continuation_price_target}, "
+        f"reversal target={previous_forecast.reversal_price_target}."
+    )
 
 
 def _identify_price_levels(
@@ -314,14 +375,6 @@ def _distance_pct(reference: float | None, latest_price: float) -> float | None:
     if reference is None or reference == 0:
         return None
     return round(((latest_price - reference) / reference) * 100, 2)
-
-
-def _region_midpoint(region: tuple[float, float]) -> float:
-    return (region[0] + region[1]) / 2
-
-
-def _format_region(region: tuple[float, float]) -> str:
-    return f"{region[0]:.2f}-{region[1]:.2f}"
 
 
 def _latest_chunk_threshold_hits(snapshot: AlphaVantageIndicatorSnapshot | None) -> list[str]:

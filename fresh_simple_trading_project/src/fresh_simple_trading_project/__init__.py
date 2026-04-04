@@ -1,3 +1,5 @@
+"""Public package exports for the trading workflow project."""
+
 from .config import RunMode, Settings
 from .workflow import TradingWorkflow
 

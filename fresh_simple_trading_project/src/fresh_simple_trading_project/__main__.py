@@ -1,3 +1,5 @@
+"""Run the trading project through the package entry point."""
+
 from .cli import main
 
 

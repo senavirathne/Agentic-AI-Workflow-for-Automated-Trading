@@ -1,3 +1,5 @@
+"""News retrieval, filtering, and summarization for the trading workflow."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,14 +9,16 @@ from html import unescape
 from itertools import zip_longest
 import logging
 import re
+import requests
 from typing import Protocol
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from xml.etree import ElementTree
 
 from .agents import NewsResearchAgent
-from .llm import TextGenerationClient
 from .models import NewsArticle, RetrievalResult
+from .storage import ResultStore
+from .utils import _as_string
 
 logger = logging.getLogger(__name__)
 
@@ -54,61 +58,114 @@ MARKET_KEYWORDS = {
 MARKET_PROXY_SYMBOLS = ["SPY", "QQQ", "DIA", "IWM"]
 NEWS_AGENT_MAX_INPUT_CHARS = 12_000
 NEWS_AGENT_SEARCH_LIMIT_PER_QUERY = 40
+NEWS_AGENT_MAX_CRITICAL_ITEMS = 3
+NEWS_AGENT_MAX_SUMMARY_CHARS = 320
+NEWS_AGENT_MAX_CRITICAL_ITEM_CHARS = 180
+ALPHA_VANTAGE_NEWS_FUNCTION = "NEWS_SENTIMENT"
+ALPHA_VANTAGE_NEWS_MAX_LIMIT = 1000
+ALPHA_VANTAGE_TIMEOUT_SECONDS = 30
 
 
 class NewsSearchClient(Protocol):
-    def search_news(self, query: str, limit: int = 10) -> list[NewsArticle]:
+    """Protocol for news providers that return article lists."""
+
+    def search_news(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        input_size_chars: int | None = None,
+    ) -> list[NewsArticle]:
         ...
 
 
 @dataclass
 class StaticNewsSearchClient:
+    """Fixed news provider used by tests and local demos."""
+
     articles: list[NewsArticle]
 
-    def search_news(self, query: str, limit: int = 10) -> list[NewsArticle]:
+    def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
+        del input_size_chars
         return list(self.articles[:limit])
 
 
 @dataclass
-class AlpacaNewsSearchClient:
-    service: object
+class AlphaVantageNewsSearchClient:
+    """News provider backed by Alpha Vantage's sentiment/news endpoint."""
+
+    api_key: str
+    base_url: str = "https://www.alphavantage.co/query"
     max_age_days: int = 7
+    http_get: object = requests.get
 
-    def search_news(self, query: str, limit: int = 10) -> list[NewsArticle]:
+    def search_news(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        input_size_chars: int | None = None,
+    ) -> list[NewsArticle]:
         try:
-            if query == MACRO_NEWS_QUERY:
-                articles = self.service.fetch_news(
-                    days=self.max_age_days,
-                    limit=max(limit * 4, 25),
-                )
-                return _filter_articles_by_keywords(articles, MACRO_KEYWORDS, limit=limit)
-
-            if query == MARKET_NEWS_QUERY:
-                articles = self.service.fetch_news(
-                    symbols=MARKET_PROXY_SYMBOLS,
-                    days=self.max_age_days,
-                    limit=max(limit * 4, 25),
-                )
-                return _filter_articles_by_keywords(articles, MARKET_KEYWORDS, limit=limit)
-
-            symbol = _extract_symbol_from_query(query)
-            if not symbol:
+            params = self._build_query_params(query, limit=limit, input_size_chars=input_size_chars)
+            if params is None:
                 return []
-            return self.service.fetch_recent_news(symbol, days=self.max_age_days, limit=limit)
+            response = self.http_get(self.base_url, params=params, timeout=ALPHA_VANTAGE_TIMEOUT_SECONDS)
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
+            payload = response.json()
+            if "Error Message" in payload:
+                raise ValueError(payload["Error Message"])
+            if "Note" in payload or "Information" in payload:
+                raise ValueError(payload.get("Note") or payload.get("Information") or "Alpha Vantage request failed.")
+            return _parse_alpha_vantage_news_feed(payload, limit=limit)
         except Exception as exc:  # pragma: no cover - external API behavior varies by environment.
-            logger.warning("Alpaca news search failed for query %r: %s", query, exc)
+            logger.warning("Alpha Vantage news search failed for query %r: %s", query, exc)
             return []
+
+    def _build_query_params(
+        self,
+        query: str,
+        *,
+        limit: int,
+        input_size_chars: int | None,
+    ) -> dict[str, str | int] | None:
+        params: dict[str, str | int] = {
+            "function": ALPHA_VANTAGE_NEWS_FUNCTION,
+            "apikey": self.api_key,
+            "sort": "LATEST",
+            "limit": min(
+                ALPHA_VANTAGE_NEWS_MAX_LIMIT,
+                max(limit, _target_article_count_for_input_size(input_size_chars)),
+            ),
+        }
+        if query == MACRO_NEWS_QUERY:
+            params["topics"] = "economy_macro,economy_monetary,economy_fiscal"
+            return params
+        if query == MARKET_NEWS_QUERY:
+            params["topics"] = "financial_markets"
+            return params
+
+        symbol = _extract_symbol_from_query(query)
+        if not symbol:
+            return None
+        params["tickers"] = symbol
+        return params
 
 
 @dataclass
 class WebSearchNewsClient:
+    """News provider backed by public RSS and web-search feeds."""
+
     endpoint: str = "https://news.google.com/rss/search"
     max_age_days: int = 7
     locale: str = "en-US"
     geography: str = "US"
     edition: str = "US:en"
 
-    def search_news(self, query: str, limit: int = 10) -> list[NewsArticle]:
+    def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
+        del input_size_chars
         params = urlencode(
             {
                 "q": f"{query} when:{max(1, self.max_age_days)}d",
@@ -142,6 +199,7 @@ class WebSearchNewsClient:
                     source=source,
                     url=str(item.findtext("link", "")).strip(),
                     published_at=_parse_rfc2822(item.findtext("pubDate")),
+                    provider="web_search",
                 )
             )
             if len(results) >= limit:
@@ -151,50 +209,62 @@ class WebSearchNewsClient:
 
 @dataclass
 class CombinedNewsSearchClient:
+    """Merge multiple news providers into one aggregated client."""
+
     clients: list[NewsSearchClient]
 
-    def search_news(self, query: str, limit: int = 10) -> list[NewsArticle]:
+    def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
         merged: list[NewsArticle] = []
         seen: set[str] = set()
         for client in self.clients:
-            for article in client.search_news(query, limit=limit):
-                key = _article_key(article)
+            for article in client.search_news(query, limit=limit, input_size_chars=input_size_chars):
+                key = _combined_article_key(article)
                 if key in seen:
                     continue
                 seen.add(key)
                 merged.append(article)
-                if len(merged) >= limit:
-                    return merged
         return merged
 
 
 @dataclass
 class InformationRetrievalModule:
+    """Fetch articles and compress them into trading-ready context."""
+
     news_client: NewsSearchClient
-    llm_client: TextGenerationClient | None = None
     news_agent: NewsResearchAgent | None = None
+    news_archive: ResultStore | None = None
     max_article_age_days: int = 7
 
-    def __post_init__(self) -> None:
-        if self.news_agent is None and self.llm_client is not None:
-            self.news_agent = NewsResearchAgent(llm_client=self.llm_client)
-
-    def retrieve(self, symbol: str, limit: int = 10) -> RetrievalResult:
+    def retrieve(
+        self,
+        symbol: str,
+        limit: int = 10,
+        *,
+        input_size_chars: int | None = None,
+        published_at_lte: datetime | str | None = None,
+    ) -> RetrievalResult:
+        target_input_chars = input_size_chars or NEWS_AGENT_MAX_INPUT_CHARS
         queries = _build_news_queries(symbol)
-        per_query_limit = max(limit, NEWS_AGENT_SEARCH_LIMIT_PER_QUERY)
+        per_query_limit = max(limit, NEWS_AGENT_SEARCH_LIMIT_PER_QUERY, _target_article_count_for_input_size(target_input_chars))
         article_batches = [
-            _filter_recent_articles(
-                self.news_client.search_news(query, limit=per_query_limit),
-                max_age_days=self.max_article_age_days,
+            self._load_query_articles(
+                symbol,
+                query,
+                limit=per_query_limit,
+                input_size_chars=target_input_chars,
+                published_at_lte=published_at_lte,
             )
             for query in queries
         ]
         candidate_articles = _sort_articles_newest_first(
-            _interleave_unique_articles(article_batches, max_items=max(limit * 4, NEWS_AGENT_SEARCH_LIMIT_PER_QUERY))
+            _interleave_unique_articles(
+                article_batches,
+                max_items=max(limit * 4, per_query_limit * len(queries)),
+            )
         )
         articles = _select_articles_for_news_agent(
             candidate_articles,
-            max_input_chars=NEWS_AGENT_MAX_INPUT_CHARS,
+            max_input_chars=target_input_chars,
         )
         headlines = [article.headline for article in articles[:limit]]
         news_summary = self._summarize_with_llm(
@@ -202,21 +272,63 @@ class InformationRetrievalModule:
             articles=articles,
             search_queries=queries,
         )
-        summary_note = news_summary.summary_note if news_summary is not None else None
-        critical_news = news_summary.critical_news if news_summary and news_summary.critical_news else []
+        summary_note = _compress_text(
+            news_summary.summary_note if news_summary is not None else None,
+            max_chars=NEWS_AGENT_MAX_SUMMARY_CHARS,
+        )
+        critical_news = _compress_text_list(
+            news_summary.critical_news if news_summary and news_summary.critical_news else [],
+            max_items=NEWS_AGENT_MAX_CRITICAL_ITEMS,
+            max_chars_per_item=NEWS_AGENT_MAX_CRITICAL_ITEM_CHARS,
+        )
         risk_flags = news_summary.risk_flags if news_summary and news_summary.risk_flags else []
         catalysts = news_summary.catalysts if news_summary and news_summary.catalysts else []
+        display_headlines = critical_news if critical_news else headlines[:NEWS_AGENT_MAX_CRITICAL_ITEMS]
 
         return RetrievalResult(
             symbol=symbol,
             articles=articles,
-            headline_summary=headlines,
+            headline_summary=display_headlines,
             sentiment_score=0.0,
             critical_news=critical_news,
             risk_flags=risk_flags,
             catalysts=catalysts,
             summary_note=summary_note,
         )
+
+    def _load_query_articles(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        limit: int,
+        input_size_chars: int,
+        published_at_lte: datetime | str | None,
+    ) -> list[NewsArticle]:
+        live_articles = _filter_articles_published_at_lte(
+            _sort_articles_newest_first(
+                self.news_client.search_news(
+                    query,
+                    limit=limit,
+                    input_size_chars=input_size_chars,
+                )
+            ),
+            published_at_lte=published_at_lte,
+        )
+        if self.news_archive is None:
+            return _filter_articles_for_decision_context(live_articles, symbol)
+
+        if live_articles:
+            self.news_archive.save_retrieved_news(symbol, query, live_articles)
+        cached_articles = self.news_archive.load_retrieved_news(
+            symbol,
+            query,
+            limit=max(limit * 4, limit),
+            published_at_lte=published_at_lte,
+        )
+        if cached_articles:
+            return _sort_articles_newest_first(_filter_articles_for_decision_context(cached_articles, symbol))
+        return _filter_articles_for_decision_context(live_articles, symbol)
 
     def _summarize_with_llm(
         self,
@@ -288,15 +400,38 @@ def _select_articles_for_news_agent(
     return selected
 
 
-def _filter_recent_articles(articles: list[NewsArticle], max_age_days: int) -> list[NewsArticle]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, max_age_days))
-    recent: list[NewsArticle] = []
-    for article in articles:
-        published_at = _parse_published_at(article.published_at)
-        if published_at is not None and published_at < cutoff:
+def _target_article_count_for_input_size(input_size_chars: int | None) -> int:
+    if input_size_chars is None:
+        return 50
+    # Assume roughly 400 chars per article line in the LLM prompt.
+    return max(25, min(ALPHA_VANTAGE_NEWS_MAX_LIMIT, input_size_chars // 400))
+
+
+def _parse_alpha_vantage_news_feed(payload: dict, *, limit: int) -> list[NewsArticle]:
+    feed = payload.get("feed")
+    if not isinstance(feed, list):
+        return []
+
+    articles: list[NewsArticle] = []
+    for item in feed:
+        if not isinstance(item, dict):
             continue
-        recent.append(article)
-    return recent
+        primary_ticker, primary_relevance = _extract_primary_ticker(item)
+        articles.append(
+            NewsArticle(
+                headline=_as_string(item.get("title")) or "",
+                summary=_as_string(item.get("summary")) or "",
+                source=_as_string(item.get("source")) or _as_string(item.get("source_domain")) or "",
+                url=_as_string(item.get("url")) or "",
+                published_at=_parse_alpha_vantage_time_published(item.get("time_published")),
+                provider="alpha_vantage",
+                primary_ticker=primary_ticker,
+                primary_ticker_relevance=primary_relevance,
+            )
+        )
+        if len(articles) >= limit:
+            break
+    return [article for article in articles if article.headline]
 
 
 def _news_agent_article_line(article: NewsArticle) -> str:
@@ -323,6 +458,74 @@ def _parse_published_at(raw: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _parse_alpha_vantage_time_published(raw: object) -> str | None:
+    candidate = _as_string(raw)
+    if candidate is None:
+        return None
+    for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
+        try:
+            parsed = datetime.strptime(candidate, fmt).replace(tzinfo=timezone.utc)
+            return parsed.isoformat().replace("+00:00", "Z")
+        except ValueError:
+            continue
+    return None
+
+
+def _compress_text(value: str | None, *, max_chars: int) -> str | None:
+    candidate = _as_string(value)
+    if candidate is None:
+        return None
+    normalized = " ".join(candidate.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _compress_text_list(
+    items: list[str],
+    *,
+    max_items: int,
+    max_chars_per_item: int,
+) -> list[str]:
+    compressed: list[str] = []
+    for item in items[:max_items]:
+        value = _compress_text(item, max_chars=max_chars_per_item)
+        if value:
+            compressed.append(value)
+    return compressed
+
+
+def _filter_articles_for_decision_context(articles: list[NewsArticle], symbol: str) -> list[NewsArticle]:
+    target_symbol = symbol.upper()
+    filtered: list[NewsArticle] = []
+    for article in articles:
+        provider = article.provider.strip().lower()
+        if provider != "alpha_vantage":
+            filtered.append(article)
+            continue
+        if article.primary_ticker and article.primary_ticker.upper() == target_symbol:
+            filtered.append(article)
+    return filtered
+
+
+def _filter_articles_published_at_lte(
+    articles: list[NewsArticle],
+    *,
+    published_at_lte: datetime | str | None,
+) -> list[NewsArticle]:
+    if published_at_lte is None:
+        return list(articles)
+    cutoff = _parse_published_at(str(published_at_lte))
+    if cutoff is None:
+        return list(articles)
+    filtered: list[NewsArticle] = []
+    for article in articles:
+        published_at = _parse_published_at(article.published_at)
+        if published_at is None or published_at <= cutoff:
+            filtered.append(article)
+    return filtered
+
+
 def _article_key(article: NewsArticle) -> str:
     url = article.url.strip()
     if url:
@@ -340,10 +543,41 @@ def _article_key(article: NewsArticle) -> str:
     )
 
 
+def _combined_article_key(article: NewsArticle) -> str:
+    provider = article.provider.strip().lower()
+    return f"{provider}::{_article_key(article)}" if provider else _article_key(article)
+
+
 def _extract_symbol_from_query(query: str) -> str:
     if not query.strip():
         return ""
     return query.strip().split()[0].upper()
+
+
+def _extract_primary_ticker(item: dict[str, object]) -> tuple[str | None, float | None]:
+    raw_ticker_sentiment = item.get("ticker_sentiment")
+    if not isinstance(raw_ticker_sentiment, list) or not raw_ticker_sentiment:
+        return None, None
+
+    primary_item: dict[str, object] | None = None
+    primary_relevance: float | None = None
+    for candidate in raw_ticker_sentiment:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            relevance = float(candidate.get("relevance_score", 0) or 0)
+        except (TypeError, ValueError):
+            relevance = 0.0
+        if primary_item is None or relevance > (primary_relevance or 0.0):
+            primary_item = candidate
+            primary_relevance = relevance
+
+    if primary_item is None:
+        return None, None
+    ticker = _as_string(primary_item.get("ticker"))
+    if ticker is None:
+        return None, None
+    return ticker.upper(), primary_relevance
 
 
 def _filter_articles_by_keywords(

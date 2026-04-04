@@ -1,10 +1,10 @@
+"""Market data and account-state collection helpers for workflow inputs."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Protocol
 
-import numpy as np
 import pandas as pd
 
 from .config import TradingConfig
@@ -12,43 +12,44 @@ from .models import AccountState, CollectedMarketData
 
 
 class MarketDataClient(Protocol):
+    """Protocol for market-data providers that return bar history."""
+
     def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
         ...
 
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
         ...
 
+    def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        ...
+
 
 class AccountClient(Protocol):
+    """Protocol for account-state providers used by the workflow."""
+
     def get_account_state(self, symbol: str) -> AccountState:
         ...
 
 
 @dataclass
-class StaticAccountClient:
-    cash: float
-    position_qty: int = 0
-    market_open: bool = True
-
-    def get_account_state(self, symbol: str) -> AccountState:
-        return AccountState(
-            cash=self.cash,
-            position_qty=self.position_qty,
-            market_open=self.market_open,
-        )
-
-
-@dataclass
 class SimulatedAccountClient:
+    """In-memory account model that updates itself on simulated fills."""
+
     cash: float
     position_qty: int = 0
     market_open: bool = True
+    avg_entry_price: float | None = None
+    realized_profit: float = 0.0
+    trade_count: int = 0
 
     def get_account_state(self, symbol: str) -> AccountState:
         return AccountState(
             cash=float(self.cash),
             position_qty=int(self.position_qty),
             market_open=self.market_open,
+            avg_entry_price=self.avg_entry_price,
+            realized_profit=float(self.realized_profit),
+            trade_count=int(self.trade_count),
         )
 
     def apply_fill(self, symbol: str, qty: int, side: str, price: float) -> AccountState:
@@ -62,22 +63,35 @@ class SimulatedAccountClient:
                 raise ValueError(
                     f"Simulated account rejected BUY {quantity} {symbol} at {price:.2f}: insufficient cash."
                 )
+            if self.position_qty > 0 and self.avg_entry_price is not None:
+                existing_cost = self.position_qty * self.avg_entry_price
+                self.avg_entry_price = (existing_cost + cost) / (self.position_qty + quantity)
+            else:
+                self.avg_entry_price = float(price)
             self.cash -= cost
             self.position_qty += quantity
+            self.trade_count += 1
             return self.get_account_state(symbol)
         if normalized_side == "SELL":
             if quantity > self.position_qty:
                 raise ValueError(
                     f"Simulated account rejected SELL {quantity} {symbol}: position size is {self.position_qty}."
                 )
+            if self.avg_entry_price is not None:
+                self.realized_profit += (float(price) - self.avg_entry_price) * quantity
             self.cash += float(quantity) * float(price)
             self.position_qty -= quantity
+            self.trade_count += 1
+            if self.position_qty == 0:
+                self.avg_entry_price = None
             return self.get_account_state(symbol)
         raise ValueError(f"Unsupported simulated order side: {side}")
 
 
 @dataclass
 class StaticMarketDataClient:
+    """Simple market-data client backed by a fixed dataframe."""
+
     frame: pd.DataFrame
 
     def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
@@ -86,47 +100,8 @@ class StaticMarketDataClient:
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
         return resample_to_hourly_bars(self.fetch_five_minute_bars(symbol))
 
-
-@dataclass
-class SyntheticMarketDataClient:
-    periods: int = 4_800
-    seed: int = 7
-    start_price: float = 100.0
-
-    def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
-        rng = np.random.default_rng(self.seed)
-        now = datetime.now(timezone.utc)
-        interval_end = now.replace(
-            minute=(now.minute // 5) * 5,
-            second=0,
-            microsecond=0,
-        )
-        index = pd.date_range(
-            end=interval_end,
-            periods=self.periods,
-            freq="5min",
-            tz="UTC",
-        )
-        returns = rng.normal(loc=0.00007, scale=0.002, size=self.periods)
-        close = self.start_price * (1 + returns).cumprod()
-        open_ = np.r_[close[0], close[:-1]]
-        high = np.maximum(open_, close) * (1 + rng.uniform(0.0001, 0.003, size=self.periods))
-        low = np.minimum(open_, close) * (1 - rng.uniform(0.0001, 0.003, size=self.periods))
-        volume = rng.integers(10_000, 100_000, size=self.periods)
-        frame = pd.DataFrame(
-            {
-                "open": open_,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": volume,
-            },
-            index=index,
-        )
-        return _normalize_ohlcv_bars(frame)
-
-    def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
-        return resample_to_hourly_bars(self.fetch_five_minute_bars(symbol))
+    def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        return _close_price_at_or_before(self.fetch_five_minute_bars(symbol), timestamp)
 
 
 @dataclass
@@ -152,6 +127,9 @@ class HistoricalReplayDataClient:
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
         return self._slice_until(self.hourly_history)
 
+    def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        return _close_price_at_or_before(self._slice_until(self.five_min_history), timestamp)
+
     def advance_to(self, timestamp: pd.Timestamp) -> None:
         self.current_time = _normalize_end_timestamp(timestamp)
 
@@ -166,6 +144,8 @@ class HistoricalReplayDataClient:
 
 @dataclass
 class DataCollectionModule:
+    """Assemble market and account data into workflow-ready snapshots."""
+
     market_data_client: MarketDataClient
     account_client: AccountClient
 
@@ -177,6 +157,9 @@ class DataCollectionModule:
 
     def fetch_hourly_history(self, symbol: str) -> pd.DataFrame:
         return self.market_data_client.fetch_hourly_bars(symbol)
+
+    def fetch_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        return float(self.market_data_client.get_price_at_or_before(symbol, timestamp))
 
     def fetch_sr_bars(
         self,
@@ -247,6 +230,7 @@ class DataCollectionModule:
 
 
 def resample_to_hourly_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """Resample a 5-minute OHLCV frame into hourly bars."""
     aggregated = frame.resample("1h").agg(
         {
             "open": "first",
@@ -281,6 +265,20 @@ def _slice_window(
         end_timestamp = pd.Timestamp(frame.index[-1]).tz_convert("UTC")
     cutoff = end_timestamp - window
     return frame.loc[(frame.index >= cutoff) & (frame.index <= end_timestamp)].copy()
+
+
+def _close_price_at_or_before(
+    frame: pd.DataFrame,
+    timestamp: pd.Timestamp | str,
+) -> float:
+    normalized = _normalize_ohlcv_bars(frame)
+    target = _normalize_end_timestamp(timestamp)
+    if target is None:
+        raise ValueError("A timestamp is required to fetch a historical price.")
+    eligible = normalized.loc[normalized.index <= target]
+    if eligible.empty:
+        raise ValueError(f"No OHLCV bar is available at or before {target.isoformat()}.")
+    return float(eligible.iloc[-1]["close"])
 
 
 def _normalize_ohlcv_bars(frame: pd.DataFrame) -> pd.DataFrame:

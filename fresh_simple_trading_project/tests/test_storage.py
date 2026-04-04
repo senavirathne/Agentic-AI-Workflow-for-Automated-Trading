@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 import sqlalchemy as sa
+from sqlalchemy.dialects import mssql
+from sqlalchemy.schema import CreateTable
 
 from fresh_simple_trading_project.config import Settings
 from fresh_simple_trading_project.models import (
@@ -86,6 +88,122 @@ def test_sqlalchemy_result_store_persists_artifacts_and_state(tmp_path: Path) ->
     assert backtest_count == 1
 
 
+def test_sqlalchemy_result_store_loads_alpha_vantage_snapshot_and_hour_chunk(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+    snapshot = _sample_alpha_vantage_snapshot()
+
+    store.save_alpha_vantage_indicator_snapshot(snapshot)
+
+    loaded_snapshot = store.load_alpha_vantage_indicator_snapshot(
+        "AAPL",
+        trading_day="2025-01-01",
+        interval="5min",
+    )
+    loaded_chunk = store.load_alpha_vantage_hour_chunk(
+        "AAPL",
+        as_of="2025-01-01T11:03:00Z",
+        interval="5min",
+    )
+
+    assert loaded_snapshot is not None
+    assert loaded_snapshot.trading_day == "2025-01-01"
+    assert loaded_snapshot.rows == snapshot.rows
+    assert loaded_chunk is not None
+    assert loaded_chunk.slot_start == "2025-01-01 11:00:00"
+    assert loaded_chunk.slot_end == "2025-01-01 11:00:00"
+    assert len(loaded_chunk.rows) == 1
+    assert loaded_chunk.rows[0]["time"] == "2025-01-01 11:00:00"
+
+
+def test_sqlalchemy_result_store_loads_all_alpha_vantage_snapshots(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+    store.save_alpha_vantage_indicator_snapshot(_sample_alpha_vantage_snapshot_for_day("2025-01-01"))
+    store.save_alpha_vantage_indicator_snapshot(_sample_alpha_vantage_snapshot_for_day("2025-01-02"))
+
+    snapshots = store.load_alpha_vantage_indicator_snapshots("AAPL", interval="5min")
+
+    assert [snapshot.trading_day for snapshot in snapshots] == ["2025-01-01", "2025-01-02"]
+
+
+def test_sqlalchemy_result_store_caches_retrieved_news_by_published_date(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+    query = "AAPL stock market news"
+    store.save_retrieved_news(
+        "AAPL",
+        query,
+        [
+            NewsArticle(
+                headline="Older article",
+                source="Wire",
+                url="https://example.com/older",
+                published_at="2025-01-01T10:00:00Z",
+                provider="web_search",
+            ),
+            NewsArticle(
+                headline="Newer article",
+                source="Wire",
+                url="https://example.com/newer",
+                published_at="2025-01-01T12:00:00Z",
+                provider="alpha_vantage",
+                primary_ticker="AAPL",
+                primary_ticker_relevance=0.81,
+            ),
+            NewsArticle(
+                headline="Newer article",
+                source="Wire",
+                url="https://example.com/newer",
+                published_at="2025-01-01T12:00:00Z",
+                provider="alpha_vantage",
+                primary_ticker="AAPL",
+                primary_ticker_relevance=0.81,
+            ),
+        ],
+    )
+
+    loaded = store.load_retrieved_news("AAPL", query, limit=5)
+
+    assert [article.headline for article in loaded] == ["Newer article", "Older article"]
+    assert loaded[0].provider == "alpha_vantage"
+    assert loaded[0].primary_ticker == "AAPL"
+    assert loaded[0].primary_ticker_relevance == 0.81
+    assert loaded[1].provider == "web_search"
+    with store.engine.begin() as connection:
+        cached_count = connection.execute(sa.select(sa.func.count()).select_from(store.retrieved_news_table)).scalar_one()
+    assert cached_count == 2
+
+
+def test_sqlalchemy_result_store_filters_cached_news_to_cutoff(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+    query = "AAPL stock market news"
+    store.save_retrieved_news(
+        "AAPL",
+        query,
+        [
+            NewsArticle(
+                headline="Before cutoff",
+                source="Wire",
+                url="https://example.com/before",
+                published_at="2025-01-01T12:00:00Z",
+            ),
+            NewsArticle(
+                headline="After cutoff",
+                source="Wire",
+                url="https://example.com/after",
+                published_at="2025-01-01T13:00:00Z",
+            ),
+        ],
+    )
+
+    loaded = store.load_retrieved_news(
+        "AAPL",
+        query,
+        limit=5,
+        published_at_lte="2025-01-01T12:30:00Z",
+    )
+
+    assert [article.headline for article in loaded] == ["Before cutoff"]
+
+
 def test_azure_blob_raw_store_uses_factory_and_returns_blob_urls() -> None:
     service_client = _FakeBlobServiceClient()
     store = AzureBlobRawStore(
@@ -117,6 +235,30 @@ def test_store_builders_select_azure_providers(tmp_path: Path, monkeypatch) -> N
 
     assert isinstance(build_raw_store(settings), AzureBlobRawStore)
     assert isinstance(build_result_store(settings), AzureSQLResultStore)
+
+
+def test_retrieved_news_query_column_stays_indexable_for_mssql(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+
+    ddl = str(CreateTable(store.retrieved_news_table).compile(dialect=mssql.dialect()))
+
+    assert "query VARCHAR(512) NOT NULL" in ddl
+    assert "query VARCHAR(max) NOT NULL" not in ddl
+
+
+def test_count_executed_trades_uses_mssql_safe_boolean_comparison(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+
+    statement = (
+        sa.select(sa.func.count())
+        .select_from(store.workflow_runs_table)
+        .where(store.workflow_runs_table.c.symbol == "AAPL")
+        .where(store.workflow_runs_table.c.executed == sa.true())
+    )
+    compiled = str(statement.compile(dialect=mssql.dialect()))
+
+    assert "workflow_runs.executed = 1" in compiled
+    assert "workflow_runs.executed IS 1" not in compiled
 
 
 def _sample_bars() -> pd.DataFrame:
@@ -185,20 +327,24 @@ def _sample_workflow_result() -> WorkflowResult:
 
 
 def _sample_alpha_vantage_snapshot() -> AlphaVantageIndicatorSnapshot:
+    return _sample_alpha_vantage_snapshot_for_day("2025-01-01")
+
+
+def _sample_alpha_vantage_snapshot_for_day(trading_day: str) -> AlphaVantageIndicatorSnapshot:
     rows = [
-        {"time": "2025-01-01 11:00:00", "RSI": 52.0, "ADX": 23.5, "threshold_hits": ["ADX_STRONG_TREND"]},
-        {"time": "2025-01-01 11:05:00", "RSI": 72.0, "ADX": 28.0, "threshold_hits": ["RSI_OVERBOUGHT"]},
+        {"time": f"{trading_day} 11:00:00", "RSI": 52.0, "ADX": 23.5, "threshold_hits": ["ADX_STRONG_TREND"]},
+        {"time": f"{trading_day} 11:05:00", "RSI": 72.0, "ADX": 28.0, "threshold_hits": ["RSI_OVERBOUGHT"]},
     ]
     latest_chunk = IndicatorHourChunk(
-        slot_start="2025-01-01 11:00:00",
-        slot_end="2025-01-01 11:05:00",
+        slot_start=f"{trading_day} 11:00:00",
+        slot_end=f"{trading_day} 11:05:00",
         rows=rows,
     )
     return AlphaVantageIndicatorSnapshot(
         symbol="AAPL",
         interval="5min",
-        trading_day="2025-01-01",
-        latest_timestamp="2025-01-01 11:05:00",
+        trading_day=trading_day,
+        latest_timestamp=f"{trading_day} 11:05:00",
         indicator_columns=["RSI", "ADX"],
         rows=rows,
         hourly_chunks=[latest_chunk],

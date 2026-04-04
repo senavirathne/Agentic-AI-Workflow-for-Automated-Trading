@@ -1,3 +1,5 @@
+"""Command-line entry points for running the trading workflow."""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +16,7 @@ from .workflow import build_result_store, build_workflow, format_reasoning_lines
 
 
 def main() -> None:
+    """Parse CLI arguments and execute the requested workflow command."""
     parser = argparse.ArgumentParser(description="Unified live trading and backtesting workflow")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -37,12 +40,13 @@ def main() -> None:
 
     args = parser.parse_args()
     _override_runtime_env(mode=getattr(args, "mode", None), symbol=getattr(args, "symbol", None))
+    project_root = _resolve_project_root()
 
     if args.command == "alpha-vantage-indicators":
-        _print_alpha_vantage_snapshot(symbol=args.symbol)
+        _print_alpha_vantage_snapshot(symbol=args.symbol, project_root=project_root)
         return
 
-    workflow = build_workflow(project_root=Path.cwd())
+    workflow = build_workflow(project_root=project_root)
 
     if args.command == "run":
         results = workflow.run_loop(
@@ -62,10 +66,24 @@ def main() -> None:
 
 
 def _override_runtime_env(*, mode: str | None, symbol: str | None) -> None:
+    """Apply CLI overrides through environment variables before settings load."""
     if mode:
         os.environ["RUN_MODE"] = mode
     if symbol:
         os.environ["TRADING_SYMBOL"] = symbol.upper()
+
+
+def _resolve_project_root(start: Path | None = None) -> Path:
+    """Resolve the standalone project root even when invoked from `src/`."""
+    current = Path(start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "pyproject.toml").is_file() and (candidate / "src" / "fresh_simple_trading_project").is_dir():
+            return candidate
+
+    fallback = Path(__file__).resolve().parents[2]
+    if (fallback / "src" / "fresh_simple_trading_project").is_dir():
+        return fallback
+    return current
 
 
 def _print_run_summary(
@@ -75,6 +93,7 @@ def _print_run_summary(
     json_output: bool,
     symbol: str | None,
 ) -> None:
+    """Render a run-loop summary in text or JSON form."""
     target_symbol = (symbol or workflow.settings.trading.symbol).upper()
     mode = workflow.settings.trading.mode
     if mode == RunMode.BACKTEST:
@@ -92,6 +111,7 @@ def _print_run_summary(
                         "symbol": target_symbol,
                         "iterations": len(results),
                         "ending_cash": summary.ending_cash,
+                        "net_profit": summary.net_profit,
                         "total_return_pct": summary.total_return_pct,
                         "benchmark_return_pct": summary.benchmark_return_pct,
                         "trade_count": summary.trade_count,
@@ -108,6 +128,7 @@ def _print_run_summary(
                     f"Symbol: {target_symbol}",
                     f"Iterations: {len(results)}",
                     f"Ending Cash: {summary.ending_cash:.2f}",
+                    f"Net Profit: {summary.net_profit:.2f}",
                     f"Total Return %: {summary.total_return_pct:.2f}",
                     f"Benchmark Return %: {summary.benchmark_return_pct:.2f}",
                     f"Trade Count: {summary.trade_count}",
@@ -145,6 +166,7 @@ def _print_run_summary(
 
 
 def _trade_once_payload(mode: RunMode, result: WorkflowResult) -> dict[str, object]:
+    """Build the structured payload for a single workflow iteration."""
     return {
         "mode": mode.value,
         "symbol": result.symbol,
@@ -157,12 +179,17 @@ def _trade_once_payload(mode: RunMode, result: WorkflowResult) -> dict[str, obje
         "quantity": result.decision.quantity,
         "confidence": result.decision.confidence,
         "execution_status": result.execution.status,
+        "protective_order_ids": result.execution.protective_order_ids,
+        "performance": _performance_payload(result.performance),
+        "previous_forecast": _forecast_payload(result.previous_forecast),
+        "hold_forecast": _forecast_payload(result.hold_forecast),
         "alpha_vantage_indicator_snapshot": _alpha_vantage_payload(result.alpha_vantage_indicator_snapshot),
         "reasoning": _reasoning_payload(result),
     }
 
 
 def _reasoning_payload(result: WorkflowResult) -> dict[str, object]:
+    """Serialize the agent handoffs and supporting reasoning fields."""
     return {
         "technical_agent": result.analysis.llm_summary,
         "news_agent": result.retrieval.summary_note,
@@ -171,11 +198,15 @@ def _reasoning_payload(result: WorkflowResult) -> dict[str, object]:
         "risk_warnings": result.risk.warnings,
         "decision_rationale": result.decision.rationale,
         "headline_summary": result.retrieval.headline_summary,
+        "performance": _performance_payload(result.performance),
+        "previous_forecast": _forecast_payload(result.previous_forecast),
+        "hold_forecast": _forecast_payload(result.hold_forecast),
         "alpha_vantage_indicator_snapshot": _alpha_vantage_payload(result.alpha_vantage_indicator_snapshot),
     }
 
 
 def _format_trade_once_output(mode: RunMode, result: WorkflowResult) -> str:
+    """Format a readable text summary for a single iteration."""
     lines = [
         f"Mode: {mode.value}",
         f"Symbol: {result.symbol}",
@@ -183,6 +214,7 @@ def _format_trade_once_output(mode: RunMode, result: WorkflowResult) -> str:
         f"Quantity: {result.decision.quantity}",
         f"Confidence: {result.decision.confidence:.2f}",
         f"Execution: {result.execution.status}",
+        f"Protective Orders: {result.execution.protective_order_ids or '<none>'}",
         "",
         "Reasoning:",
     ]
@@ -191,17 +223,45 @@ def _format_trade_once_output(mode: RunMode, result: WorkflowResult) -> str:
 
 
 def _alpha_vantage_payload(snapshot: AlphaVantageIndicatorSnapshot | None) -> dict[str, object] | None:
+    """Serialize an Alpha Vantage snapshot dataclass for CLI output."""
     if snapshot is None:
         return None
     return asdict(snapshot)
 
 
-def _print_alpha_vantage_snapshot(*, symbol: str | None) -> None:
-    settings = Settings.from_env(project_root=Path.cwd())
+def _forecast_payload(snapshot) -> dict[str, object] | None:
+    """Serialize a forecast snapshot for CLI output."""
+    if snapshot is None:
+        return None
+    payload = asdict(snapshot)
+    for key in ("generated_at", "valid_until"):
+        if payload.get(key) is not None:
+            payload[key] = str(payload[key])
+    return payload
+
+
+def _performance_payload(snapshot) -> dict[str, object] | None:
+    """Serialize a performance snapshot for CLI output."""
+    if snapshot is None:
+        return None
+    payload = asdict(snapshot)
+    if payload.get("as_of") is not None:
+        payload["as_of"] = str(payload["as_of"])
+    return payload
+
+
+def _print_alpha_vantage_snapshot(*, symbol: str | None, project_root: Path | None = None) -> None:
+    """Fetch, persist, and print the latest Alpha Vantage indicator snapshot."""
+    settings = Settings.from_env(project_root=project_root or _resolve_project_root())
     target_symbol = (symbol or settings.trading.symbol).upper()
-    service = AlphaVantageIndicatorService(settings.alpha_vantage)
+    result_store = build_result_store(settings)
+    service = AlphaVantageIndicatorService(
+        settings.alpha_vantage,
+        cache_dir=settings.paths.data_dir / "alpha_vantage",
+        result_store=result_store,
+    )
     snapshot = service.build_snapshot(target_symbol)
-    build_result_store(settings).save_alpha_vantage_indicator_snapshot(snapshot)
+    result_store.save_alpha_vantage_indicator_snapshot(snapshot)
     print(json.dumps(asdict(snapshot), indent=2))
 
 

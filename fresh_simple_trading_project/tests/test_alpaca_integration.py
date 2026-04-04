@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pandas as pd
@@ -10,7 +11,6 @@ import fresh_simple_trading_project.workflow as workflow_module
 from fresh_simple_trading_project.alpaca_integration import (
     AlpacaAccountClient,
     AlpacaBrokerClient,
-    AlpacaHistoricalMarketDataClient,
     AlpacaMarketDataClient,
     AlpacaService,
 )
@@ -42,12 +42,29 @@ def test_alpaca_historical_market_data_client_fetches_hourly_bars() -> None:
     stock_client = FakeStockHistoricalDataClient(_make_alpaca_bar_frame_with_freq("1h"))
     service.__dict__["stock_data_client"] = stock_client
 
-    frame = AlpacaHistoricalMarketDataClient(service, history_lookback_days=30).fetch_hourly_bars("AAPL")
+    frame = AlpacaMarketDataClient(service, hourly_lookback_days=30).fetch_hourly_bars("AAPL")
 
     assert stock_client.last_request is not None
     assert stock_client.last_request.timeframe.amount == 1
     assert stock_client.last_request.timeframe.unit == TimeFrameUnit.Hour
     assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+
+
+def test_alpaca_historical_market_data_client_fetches_price_at_or_before() -> None:
+    config = AlpacaConfig(api_key="key", api_secret="secret")
+    service = AlpacaService(config)
+    stock_client = FakeStockHistoricalDataClient(_make_alpaca_bar_frame())
+    service.__dict__["stock_data_client"] = stock_client
+
+    price = AlpacaMarketDataClient(service, five_minute_lookback_days=30).get_price_at_or_before(
+        "AAPL",
+        "2025-01-01T00:07:00Z",
+    )
+
+    assert stock_client.last_request is not None
+    assert stock_client.last_request.timeframe.amount == 5
+    assert stock_client.last_request.timeframe.unit == TimeFrameUnit.Minute
+    assert price == 101.5
 
 
 def test_alpaca_account_client_reads_buying_power_position_and_clock() -> None:
@@ -87,11 +104,25 @@ def test_alpaca_broker_client_submits_market_order() -> None:
     assert trading_client.last_submitted_order.side.value == "buy"
 
 
+def test_alpaca_service_get_current_price_uses_yfinance(monkeypatch) -> None:
+    config = AlpacaConfig(api_key="key", api_secret="secret")
+    service = AlpacaService(config)
+
+    fake_ticker = SimpleNamespace(info={"currentPrice": 173.45})
+    fake_yfinance = SimpleNamespace(Tickers=lambda symbols: SimpleNamespace(tickers={"AAPL": fake_ticker}))
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yfinance)
+
+    price = service.get_current_price("AAPL")
+
+    assert price == 173.45
+
+
 def test_build_workflow_uses_alpaca_clients_when_notebook_credentials_are_present(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("RUN_MODE", "live")
     monkeypatch.setenv("ALPACA_PAPER_API_KEY", "alpaca-key")
     monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "alpaca-secret")
 
@@ -140,6 +171,61 @@ def test_build_workflow_uses_alpaca_clients_when_notebook_credentials_are_presen
     assert isinstance(workflow.data_collection.account_client, AlpacaAccountClient)
     assert isinstance(workflow.execution_module, ExecutionModule)
     assert isinstance(workflow.execution_module.broker_client, AlpacaBrokerClient)
+
+
+def test_build_workflow_forces_alpaca_provider_for_live_mode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("RUN_MODE", "live")
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "alpaca-key")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "alpaca-secret")
+    monkeypatch.setenv("LIVE_MARKET_DATA_PROVIDER", "alpha_vantage")
+
+    class DummyAlpacaService:
+        def __init__(self, config: AlpacaConfig) -> None:
+            self.config = config
+
+        def fetch_five_minute_bars(self, symbol: str, lookback_days: int) -> pd.DataFrame:
+            index = pd.date_range("2025-01-01", periods=24, freq="5min", tz="UTC")
+            return pd.DataFrame(
+                {
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000,
+                },
+                index=index,
+            )
+
+        def fetch_hourly_bars(self, symbol: str, lookback_days: int) -> pd.DataFrame:
+            index = pd.date_range("2025-01-01", periods=24, freq="1h", tz="UTC")
+            return pd.DataFrame(
+                {
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000,
+                },
+                index=index,
+            )
+
+        def get_account_state(self, symbol: str):
+            return SimpleNamespace(cash=10_000.0, position_qty=0, market_open=True)
+
+        def submit_market_order(self, symbol: str, qty: int, side: str) -> str:
+            return "dummy-order"
+
+    monkeypatch.setattr(workflow_module, "AlpacaService", DummyAlpacaService)
+    monkeypatch.setattr(workflow_module, "SQLiteResultStore", lambda _: InMemoryResultStore())
+
+    workflow = workflow_module.build_workflow(project_root=tmp_path)
+
+    assert workflow.settings.market_data.provider == "alpaca"
+    assert isinstance(workflow.data_collection.market_data_client, AlpacaMarketDataClient)
 
 
 def test_build_workflow_uses_historical_alpaca_client_in_backtest_mode(

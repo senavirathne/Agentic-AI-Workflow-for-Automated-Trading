@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -7,24 +9,36 @@ import pandas as pd
 import pytest
 
 import fresh_simple_trading_project.workflow as workflow_module
-from fresh_simple_trading_project.config import Settings
-from fresh_simple_trading_project.data_collection import DataCollectionModule, StaticAccountClient, StaticMarketDataClient
+from fresh_simple_trading_project.config import RunMode, Settings
+from fresh_simple_trading_project.agents import (
+    DecisionCoordinatorAgent,
+    HoldForecastAgent,
+    NewsResearchAgent,
+    RiskReviewAgent,
+    TechnicalAnalysisAgent,
+)
+from fresh_simple_trading_project.data_collection import (
+    DataCollectionModule,
+    SimulatedAccountClient,
+    StaticMarketDataClient,
+)
 from fresh_simple_trading_project.decision_engine import DecisionEngine
 from fresh_simple_trading_project.eda import EDAModule
 from fresh_simple_trading_project.execution import ExecutionModule, InMemoryBrokerClient
 from fresh_simple_trading_project.features import FeatureEngineeringModule
 from fresh_simple_trading_project.information_retrieval import (
-    AlpacaNewsSearchClient,
+    AlphaVantageNewsSearchClient,
     CombinedNewsSearchClient,
     InformationRetrievalModule,
     StaticNewsSearchClient,
     WebSearchNewsClient,
 )
-from fresh_simple_trading_project.llm import LLMRequestError, TextGenerationClient
+from fresh_simple_trading_project.llm import FallbackLLMClient, LLMRequestError, OpenAILLMClient, TextGenerationClient
 from fresh_simple_trading_project.market_analysis import MarketAnalysisModule
-from fresh_simple_trading_project.models import AlphaVantageIndicatorSnapshot, IndicatorHourChunk, NewsArticle
+from fresh_simple_trading_project.models import AlphaVantageIndicatorSnapshot, IndicatorHourChunk, NewsArticle, RetrievalResult
 from fresh_simple_trading_project.risk_analysis import RiskAnalysisModule
 from fresh_simple_trading_project.storage import InMemoryResultStore, LocalRawStore
+from fresh_simple_trading_project.utils import last_closed_us_market_day_cutoff, us_market_day_dates
 from fresh_simple_trading_project.workflow import TradingWorkflow
 
 
@@ -113,7 +127,7 @@ def test_decision_agent_receives_other_agent_handoffs(tmp_path: Path) -> None:
     assert "decision coordinator agent" in decision_system_prompt.lower()
     assert f"Technical agent handoff: {_expected_technical_prefix()}" in decision_prompt
     assert "Technical agent sees improving momentum." in decision_prompt
-    assert "News agent handoff: News agent sees supportive catalysts." in decision_prompt
+    assert 'News context JSON: {"summary_note":"News agent sees supportive catalysts.","critical_news":[],"risk_flags":[],"catalysts":[]}' in decision_prompt
     assert "Risk agent handoff: Risk agent keeps size small but acceptable." in decision_prompt
 
 
@@ -144,10 +158,34 @@ def test_agents_receive_plain_text_inputs_only(tmp_path: Path) -> None:
     assert "RSI:" in technical_prompt
     assert "Recent articles:" in news_prompt
     assert "Rule-based sentiment score" not in news_prompt
-    assert "News headlines:" in decision_prompt
+    assert 'News context JSON: {"summary_note":"News prompt shows positive earnings-driven headlines.","critical_news":[],"risk_flags":[],"catalysts":[]}' in decision_prompt
+    assert "Critical news (compressed):" not in decision_prompt
+    assert "News headlines:" not in decision_prompt
 
 
-def test_technical_agent_receives_latest_alpha_vantage_hour_chunk(tmp_path: Path) -> None:
+def test_live_trading_uses_manual_indicators_even_when_alpha_vantage_is_configured(tmp_path: Path) -> None:
+    llm_client = StubLLM(
+        [
+            "Technical prompt stays on manually computed live indicators.",
+            "News flow is positive.",
+            "Risk remains acceptable.",
+            "OVERRIDE=KEEP\nNOTE=The rule-based decision is acceptable.",
+        ]
+    )
+    workflow = _build_workflow(tmp_path, llm_client=llm_client)
+    workflow.alpha_vantage_service = StubAlphaVantageService(_sample_alpha_vantage_snapshot())
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    technical_prompt = llm_client.calls[0][1]
+    assert result.alpha_vantage_indicator_snapshot is None
+    assert result.analysis.indicator_source == "manually computed indicators from live 5-minute bar data"
+    assert "Alpha Vantage latest 1-hour indicator chunk" not in technical_prompt
+    assert workflow.alpha_vantage_service.snapshot_calls == []
+    assert workflow.alpha_vantage_service.feature_frame_calls == []
+
+
+def test_backtest_uses_latest_alpha_vantage_hour_chunk_and_feature_frame(tmp_path: Path) -> None:
     llm_client = StubLLM(
         [
             "Technical prompt confirms the Alpha Vantage hour chunk.",
@@ -157,15 +195,248 @@ def test_technical_agent_receives_latest_alpha_vantage_hour_chunk(tmp_path: Path
         ]
     )
     workflow = _build_workflow(tmp_path, llm_client=llm_client)
-    workflow.alpha_vantage_service = StubAlphaVantageService(_sample_alpha_vantage_snapshot())
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+        market_data=replace(workflow.settings.market_data, provider="alpha_vantage"),
+    )
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        feature_frame=_sample_alpha_vantage_feature_frame(_make_uptrend_bars()),
+    )
+    _seed_backtest_alpha_vantage_store(workflow)
 
-    workflow.run_once(symbol="AAPL", execute_orders=False)
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
 
     technical_prompt = llm_client.calls[0][1]
+    assert result.alpha_vantage_indicator_snapshot is not None
+    assert (
+        result.analysis.indicator_source
+        == "Alpha Vantage 5-minute indicators loaded from local storage and chunked into a 1-hour backtest step"
+    )
     assert "Alpha Vantage latest 1-hour indicator chunk" in technical_prompt
     assert "\"time\":\"2025-01-03 11:00:00\"" in technical_prompt
     assert "Alpha Vantage threshold hits in latest chunk" in technical_prompt
     assert "RSI_OVERBOUGHT" in technical_prompt
+    assert workflow.alpha_vantage_service.ensure_window_calls == []
+    assert workflow.alpha_vantage_service.snapshot_calls == []
+    assert workflow.alpha_vantage_service.feature_frame_calls == [("AAPL", pd.Timestamp("2025-01-03T11:55:00Z"))]
+    assert result.alpha_vantage_indicator_snapshot.latest_hour_chunk is not None
+    assert result.alpha_vantage_indicator_snapshot.latest_hour_chunk.slot_start == "2025-01-03 11:00:00"
+    assert len(result.alpha_vantage_indicator_snapshot.hourly_chunks) == 1
+
+
+def test_backtest_preloads_missing_alpha_vantage_snapshots_into_local_store(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        result_store=workflow.result_store,
+    )
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    assert result.alpha_vantage_indicator_snapshot is not None
+    assert len(workflow.alpha_vantage_service.ensure_window_calls) == 1
+    unique_days = [
+        candidate.isoformat()
+        for candidate in us_market_day_dates(workflow.data_collection.fetch_five_minute_history("AAPL").index)
+    ]
+    assert all(
+        workflow.result_store.load_alpha_vantage_indicator_snapshot("AAPL", trading_day=trading_day, interval="5min")
+        is not None
+        for trading_day in unique_days
+    )
+
+
+def test_backtest_uses_explicit_price_lookup_method(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    workflow.data_collection.market_data_client = RecordingPriceMarketDataClient(
+        _make_uptrend_bars(),
+        price_to_return=161.25,
+    )
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    assert result.analysis.latest_price == 161.25
+    assert workflow.data_collection.market_data_client.price_calls == [pd.Timestamp("2025-01-03T11:55:00Z")]
+
+
+def test_backtest_raises_when_alpha_vantage_preload_does_not_fill_local_store(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        populate_store=False,
+    )
+
+    with pytest.raises(RuntimeError, match="DB path"):
+        workflow.run_once(symbol="AAPL", execute_orders=False)
+
+
+def test_backtest_news_cutoff_uses_last_closed_us_market_day(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        result_store=workflow.result_store,
+    )
+    retrieval = RecordingInformationRetrievalModule()
+    workflow.information_retrieval = retrieval
+
+    workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    assert retrieval.calls
+    assert retrieval.calls[-1]["published_at_lte"] == pd.Timestamp("2025-01-02T21:00:00Z")
+
+
+def test_last_closed_us_market_day_cutoff_ignores_weekend_timestamps() -> None:
+    timestamps = pd.date_range("2025-01-03T14:00:00Z", "2025-01-05T23:00:00Z", freq="5min", tz="UTC")
+
+    cutoff = last_closed_us_market_day_cutoff(
+        "2025-01-05T18:00:00Z",
+        available_timestamps=timestamps,
+    )
+
+    assert cutoff == pd.Timestamp("2025-01-03T21:00:00Z")
+
+
+def test_us_market_day_dates_exclude_weekends_and_market_holidays() -> None:
+    timestamps = pd.date_range("2026-03-20T13:00:00Z", "2026-04-03T23:55:00Z", freq="5min", tz="UTC")
+
+    trading_days = us_market_day_dates(timestamps, max_date=date(2026, 4, 2))
+
+    assert date(2026, 3, 20) in trading_days
+    assert date(2026, 4, 2) in trading_days
+    assert date(2026, 3, 21) not in trading_days
+    assert date(2026, 3, 22) not in trading_days
+    assert date(2026, 3, 28) not in trading_days
+    assert date(2026, 3, 29) not in trading_days
+    assert date(2026, 4, 3) not in trading_days
+
+
+def test_live_llms_receive_delayed_data_notice_and_current_price(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LIVE_MARKET_DATA_PROVIDER", "alpaca")
+    monkeypatch.setenv("LIVE_MARKET_DATA_DELAY_MINUTES", "15")
+    llm_client = StubLLM(
+        [
+            "Technical prompt accounts for delayed bars and live price.",
+            "News flow is positive.",
+            "Risk prompt accounts for delayed bars and live price.",
+            "OVERRIDE=KEEP\nNOTE=Decision prompt accounts for delayed bars and live price.",
+        ]
+    )
+    workflow = _build_workflow(tmp_path, llm_client=llm_client)
+    workflow.alpaca_service = StubLivePriceService(161.25)
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    technical_prompt = llm_client.calls[0][1]
+    risk_prompt = llm_client.calls[2][1]
+    decision_prompt = llm_client.calls[3][1]
+    assert result.analysis.current_price == 161.25
+    assert result.analysis.market_data_delay_minutes == 15
+    assert "Live market data delay minutes: 15" in technical_prompt
+    assert "Current live price snapshot: 161.25" in technical_prompt
+    assert "Latest delayed 5-minute close: 160.00" in technical_prompt
+    assert "Live market data delay minutes: 15" in risk_prompt
+    assert "Current live price snapshot: 161.25" in risk_prompt
+    assert "Live market data delay minutes: 15" in decision_prompt
+    assert "Current live price snapshot: 161.25" in decision_prompt
+    assert "latest delayed close is $160.00 and current live price is $161.25" in result.analysis.llm_summary
+
+
+def test_live_workflow_tracks_trade_count_profit_and_adjusts_protective_orders(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        market_data=replace(workflow.settings.market_data, provider="alpaca"),
+        trading=replace(workflow.settings.trading, live_market_data_delay_minutes=15),
+    )
+    simulated_account = SimulatedAccountClient(cash=workflow.settings.trading.starting_cash)
+    broker = InMemoryBrokerClient(account_client=simulated_account)
+    workflow.data_collection.account_client = simulated_account
+    workflow.execution_module = ExecutionModule(broker)
+
+    workflow.alpaca_service = StubLivePriceService(160.0)
+    first = workflow.run_once(symbol="AAPL", execute_orders=True)
+
+    workflow.alpaca_service = StubLivePriceService(164.0)
+    second = workflow.run_once(symbol="AAPL", execute_orders=True)
+
+    assert first.performance is not None
+    assert first.performance.trade_count == 1
+    assert first.execution.executed is True
+    assert first.decision.action.value == "BUY"
+    assert second.performance is not None
+    assert second.performance.trade_count == 1
+    assert second.performance.current_profit > 0
+    assert second.execution.status == "protected"
+    assert second.execution.protective_order_ids
+    assert broker.protective_orders
+    assert {order["type"] for order in broker.protective_orders} == {"stop", "limit"}
+
+
+def test_workflow_reuses_previous_hold_forecast_on_next_hour(tmp_path: Path) -> None:
+    llm_client = StubLLM(
+        [
+            "Technical prompt confirms range-bound conditions.",
+            "News flow is neutral.",
+            "Risk remains acceptable but no fresh entry is justified.",
+            "ACTION=HOLD\nQUANTITY=0\nNOTE=Wait for confirmation.",
+            (
+                '{"trend_bias":"bullish","continuation_price_target":165.5,'
+                '"continuation_volume_target":62000,"reversal_price_target":157.0,'
+                '"reversal_volume_target":68000,'
+                '"continuation_signals":["Breakout stays valid above 165.5 with expanding volume."],'
+                '"reversal_signals":["Loss of 157.0 on heavy sell volume warns of reversal."],'
+                '"summary":"If AAPL clears 165.50 on expanding volume, the uptrend is still intact.",'
+                '"confidence":0.72}'
+            ),
+            "Technical prompt reviews the prior hold forecast.",
+            "News flow is still neutral.",
+            "Risk remains acceptable and references the prior hold forecast.",
+            "ACTION=HOLD\nQUANTITY=0\nNOTE=Keep waiting for confirmation.",
+            (
+                '{"trend_bias":"bullish","continuation_price_target":166.0,'
+                '"continuation_volume_target":63000,"reversal_price_target":156.5,'
+                '"reversal_volume_target":69000,'
+                '"continuation_signals":["Breakout above 166.0 keeps the move intact."],'
+                '"reversal_signals":["Failure below 156.5 on heavy volume warns of reversal."],'
+                '"summary":"The setup still needs a breakout confirmation.",'
+                '"confidence":0.7}'
+            ),
+        ]
+    )
+    workflow = _build_workflow(tmp_path, llm_client=llm_client)
+
+    first = workflow.run_once(symbol="AAPL", execute_orders=False)
+    second = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    assert first.hold_forecast is not None
+    assert second.previous_forecast is not None
+    assert second.previous_forecast.summary == "If AAPL clears 165.50 on expanding volume, the uptrend is still intact."
+    second_technical_prompt = llm_client.calls[5][1]
+    second_risk_prompt = llm_client.calls[7][1]
+    second_decision_prompt = llm_client.calls[8][1]
+    assert "Previous HOLD forecast:" in second_technical_prompt
+    assert "165.5" in second_technical_prompt
+    assert "Previous HOLD forecast:" in second_risk_prompt
+    assert "Previous HOLD forecast:" in second_decision_prompt
+    assert workflow.result_store.load_latest_forecast("AAPL") is not None
 
 
 def test_workflow_wraps_llm_errors_with_stage_context(tmp_path: Path) -> None:
@@ -196,25 +467,76 @@ def test_technical_agent_handoff_always_includes_current_datetime_and_price(tmp_
     assert "$160.00" in result.analysis.llm_summary
 
 
-def test_build_workflow_requires_deepseek_api_key(tmp_path: Path, monkeypatch) -> None:
+def test_build_workflow_requires_any_llm_api_key(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY or OPENAI_API_KEY"):
         workflow_module.build_workflow(project_root=tmp_path)
 
 
-def test_build_workflow_uses_alpaca_news_when_alpaca_credentials_are_present(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+def test_build_workflow_uses_openai_when_deepseek_is_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("RUN_MODE", "live")
     monkeypatch.setenv("ALPACA_PAPER_API_KEY", "alpaca-key")
     monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "alpaca-secret")
-    monkeypatch.setenv("MARKET_DATA_PROVIDER", "synthetic")
 
     workflow = workflow_module.build_workflow(project_root=tmp_path)
 
-    assert workflow.settings.market_data.provider == "synthetic"
+    assert isinstance(workflow.market_analysis.technical_agent.llm_client, OpenAILLMClient)
+
+
+def test_build_workflow_wraps_deepseek_with_openai_fallback_when_both_keys_exist(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("RUN_MODE", "live")
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "alpaca-key")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "alpaca-secret")
+
+    workflow = workflow_module.build_workflow(project_root=tmp_path)
+
+    assert isinstance(workflow.market_analysis.technical_agent.llm_client, FallbackLLMClient)
+
+
+def test_build_workflow_uses_alpha_vantage_news_when_credentials_are_present(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", "ABCDEFGHI1234")
+    monkeypatch.setenv("RUN_MODE", "live")
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "alpaca-key")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "alpaca-secret")
+
+    workflow = workflow_module.build_workflow(project_root=tmp_path)
+
+    assert workflow.settings.market_data.provider == "alpaca"
     assert isinstance(workflow.information_retrieval.news_client, CombinedNewsSearchClient)
-    assert isinstance(workflow.information_retrieval.news_client.clients[0], AlpacaNewsSearchClient)
+    assert isinstance(workflow.information_retrieval.news_client.clients[0], AlphaVantageNewsSearchClient)
     assert isinstance(workflow.information_retrieval.news_client.clients[1], WebSearchNewsClient)
+    assert workflow.information_retrieval.news_archive is workflow.result_store
+
+
+def test_build_workflow_requires_alpaca_replay_bars_for_backtest_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("RUN_MODE", "backtest")
+    monkeypatch.delenv("ALPACA_PAPER_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_PAPER_SECRET_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="Backtest OHLCV replay bars require Alpaca historical data"):
+        workflow_module.build_workflow(project_root=tmp_path)
+
+
+def test_build_workflow_requires_alpaca_market_data_for_live_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("LIVE_MARKET_DATA_PROVIDER", "alpha_vantage")
+    monkeypatch.delenv("ALPACA_PAPER_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_PAPER_SECRET_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="Live trading requires Alpaca market data"):
+        workflow_module.build_workflow(project_root=tmp_path)
 
 
 def test_format_reasoning_lines_show_agent_outputs_and_placeholders(tmp_path: Path) -> None:
@@ -231,38 +553,89 @@ def test_format_reasoning_lines_show_agent_outputs_and_placeholders(tmp_path: Pa
     assert any(line.startswith("  Decision Reason") for line in lines)
 
 
+def test_format_reasoning_lines_include_backtest_alpha_vantage_hour_chunks(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    workflow.alpha_vantage_service = StubAlphaVantageService(_sample_alpha_vantage_snapshot())
+    _seed_backtest_alpha_vantage_store(workflow)
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+    lines = workflow_module.format_reasoning_lines(result)
+
+    assert any("Alpha Vantage 1h Chunk 1:" in line for line in lines)
+
+
 def test_run_loop_passes_sleep_override_to_sleep_until(monkeypatch, tmp_path: Path) -> None:
     workflow = _build_workflow(tmp_path)
     sleep_calls: list[float | None] = []
 
+    class StopLoop(RuntimeError):
+        pass
+
     def fake_sleep_until(_target, sleep_seconds=None):
         sleep_calls.append(sleep_seconds)
-        return 0.0
+        raise StopLoop
 
     monkeypatch.setattr(workflow_module, "sleep_until", fake_sleep_until)
 
-    results = workflow.run_loop(
-        symbol="AAPL",
-        execute_orders=False,
-        max_iterations=2,
-        sleep_seconds=0.25,
-    )
+    with pytest.raises(StopLoop):
+        workflow.run_loop(
+            symbol="AAPL",
+            execute_orders=False,
+            max_iterations=2,
+            sleep_seconds=0.25,
+        )
 
-    assert len(results) == 1
     assert sleep_calls == [0.25]
+
+
+def test_live_run_loop_waits_for_delayed_hourly_checkpoint(monkeypatch, tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(
+            workflow.settings.trading,
+            mode=RunMode.LIVE,
+            live_market_data_delay_minutes=15,
+        ),
+        market_data=replace(workflow.settings.market_data, provider="alpaca"),
+    )
+    workflow.result_store.save_last_processed("AAPL", pd.Timestamp("2025-01-03T11:00:00Z"))
+    sleep_targets: list[tuple[object, float | None]] = []
+
+    class StopLoop(RuntimeError):
+        pass
+
+    def fake_sleep_until(target, sleep_seconds=None):
+        sleep_targets.append((target, sleep_seconds))
+        raise StopLoop
+
+    monkeypatch.setattr(workflow_module, "sleep_until", fake_sleep_until)
+
+    with pytest.raises(StopLoop):
+        workflow.run_loop(symbol="AAPL", execute_orders=False, max_iterations=1, sleep_seconds=0.25)
+
+    assert sleep_targets == [(pd.Timestamp("2025-01-03T12:15:00Z").to_pydatetime(), 0.25)]
 
 
 def _build_workflow(tmp_path: Path, llm_client: TextGenerationClient | None = None) -> TradingWorkflow:
     settings = Settings.from_env(project_root=tmp_path)
+    technical_agent = None if llm_client is None else TechnicalAnalysisAgent(llm_client=llm_client)
+    news_agent = None if llm_client is None else NewsResearchAgent(llm_client=llm_client)
+    risk_agent = None if llm_client is None else RiskReviewAgent(llm_client=llm_client)
+    decision_agent = None if llm_client is None else DecisionCoordinatorAgent(llm_client=llm_client)
     return TradingWorkflow(
         settings=settings,
         data_collection=DataCollectionModule(
             market_data_client=StaticMarketDataClient(_make_uptrend_bars()),
-            account_client=StaticAccountClient(cash=settings.trading.starting_cash),
+            account_client=SimulatedAccountClient(cash=settings.trading.starting_cash),
         ),
         eda_module=EDAModule(),
         feature_engineering=FeatureEngineeringModule(settings.trading),
-        market_analysis=MarketAnalysisModule(settings.trading, llm_client=llm_client),
+        market_analysis=MarketAnalysisModule(settings.trading, technical_agent=technical_agent),
         information_retrieval=InformationRetrievalModule(
             StaticNewsSearchClient(
                 [
@@ -272,13 +645,14 @@ def _build_workflow(tmp_path: Path, llm_client: TextGenerationClient | None = No
                     )
                 ]
             ),
-            llm_client=llm_client,
+            news_agent=news_agent,
         ),
-        risk_analysis=RiskAnalysisModule(settings.trading, llm_client=llm_client),
-        decision_engine=DecisionEngine(llm_client=llm_client),
+        risk_analysis=RiskAnalysisModule(settings.trading, risk_agent=risk_agent),
+        decision_engine=DecisionEngine(decision_agent=decision_agent),
         execution_module=ExecutionModule(InMemoryBrokerClient()),
         raw_store=LocalRawStore(settings.paths.raw_dir),
         result_store=InMemoryResultStore(),
+        hold_forecast_agent=HoldForecastAgent(llm_client=llm_client),
     )
 
 
@@ -324,11 +698,123 @@ class RaisingLLM(TextGenerationClient):
 
 
 class StubAlphaVantageService:
-    def __init__(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: AlphaVantageIndicatorSnapshot,
+        feature_frame: pd.DataFrame | None = None,
+        *,
+        result_store=None,
+        populate_store: bool = True,
+    ) -> None:
         self.snapshot = snapshot
+        self.feature_frame = feature_frame
+        self.result_store = result_store
+        self.populate_store = populate_store
+        self.ensure_window_calls: list[tuple[str, pd.Timestamp, pd.Timestamp]] = []
+        self.snapshot_calls: list[tuple[str, pd.Timestamp | str | None]] = []
+        self.feature_frame_calls: list[tuple[str, pd.Timestamp | str | None]] = []
 
-    def build_snapshot(self, symbol: str) -> AlphaVantageIndicatorSnapshot:
+    def ensure_data_for_window(
+        self,
+        symbol: str,
+        *,
+        start_time: pd.Timestamp | str,
+        end_time: pd.Timestamp | str,
+        required_trading_days: list[str] | None = None,
+    ) -> bool:
+        self.ensure_window_calls.append((symbol, pd.Timestamp(start_time), pd.Timestamp(end_time)))
+        if self.result_store is not None and self.populate_store:
+            trading_days = required_trading_days
+            if trading_days is None:
+                trading_days = [
+                    candidate.isoformat()
+                    for candidate in us_market_day_dates(
+                        pd.date_range(
+                            pd.Timestamp(start_time).normalize(),
+                            pd.Timestamp(end_time).normalize(),
+                            freq="1D",
+                            tz="UTC",
+                        )
+                    )
+                ]
+            for trading_day in trading_days:
+                self.result_store.save_alpha_vantage_indicator_snapshot(
+                    _snapshot_for_trading_day(trading_day, symbol=symbol)
+                )
+        return True
+
+    def build_snapshot(
+        self,
+        symbol: str,
+        *,
+        end_time: pd.Timestamp | str | None = None,
+    ) -> AlphaVantageIndicatorSnapshot:
+        self.snapshot_calls.append((symbol, end_time))
         return self.snapshot
+
+    def build_feature_frame(
+        self,
+        symbol: str,
+        price_bars: pd.DataFrame,
+        *,
+        end_time: pd.Timestamp | str | None = None,
+    ) -> pd.DataFrame:
+        self.feature_frame_calls.append((symbol, end_time))
+        frame = self.feature_frame.copy() if self.feature_frame is not None else _sample_alpha_vantage_feature_frame(price_bars)
+        if end_time is not None:
+            frame = frame.loc[frame.index <= pd.Timestamp(end_time)]
+        return frame
+
+
+class StubLivePriceService:
+    def __init__(self, current_price: float) -> None:
+        self.current_price = current_price
+
+    def get_current_price(self, symbol: str) -> float:
+        return self.current_price
+
+
+class RecordingPriceMarketDataClient(StaticMarketDataClient):
+    def __init__(self, frame: pd.DataFrame, *, price_to_return: float) -> None:
+        super().__init__(frame)
+        self.price_to_return = price_to_return
+        self.price_calls: list[pd.Timestamp] = []
+
+    def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        self.price_calls.append(pd.Timestamp(timestamp))
+        return float(self.price_to_return)
+
+
+class RecordingInformationRetrievalModule:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def retrieve(
+        self,
+        symbol: str,
+        limit: int = 10,
+        *,
+        input_size_chars: int | None = None,
+        published_at_lte=None,
+    ) -> RetrievalResult:
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "limit": limit,
+                "input_size_chars": input_size_chars,
+                "published_at_lte": published_at_lte,
+            }
+        )
+        return RetrievalResult(
+            symbol=symbol,
+            articles=[],
+            headline_summary=[],
+            sentiment_score=0.0,
+            critical_news=[],
+            risk_flags=[],
+            catalysts=[],
+            summary_note=None,
+        )
 
 
 def _sample_alpha_vantage_snapshot() -> AlphaVantageIndicatorSnapshot:
@@ -345,17 +831,84 @@ def _sample_alpha_vantage_snapshot() -> AlphaVantageIndicatorSnapshot:
             "ADX": 28.0,
             "threshold_hits": ["RSI_OVERBOUGHT", "ADX_STRONG_TREND"],
         },
+        {
+            "time": "2025-01-03 11:55:00",
+            "RSI": 68.0,
+            "ADX": 25.0,
+            "threshold_hits": ["ADX_STRONG_TREND"],
+        },
     ]
     latest_chunk = IndicatorHourChunk(
         slot_start="2025-01-03 11:00:00",
-        slot_end="2025-01-03 11:05:00",
+        slot_end="2025-01-03 11:55:00",
         rows=rows,
     )
     return AlphaVantageIndicatorSnapshot(
         symbol="AAPL",
         interval="5min",
         trading_day="2025-01-03",
-        latest_timestamp="2025-01-03 11:05:00",
+        latest_timestamp="2025-01-03 11:55:00",
+        indicator_columns=["RSI", "ADX"],
+        rows=rows,
+        hourly_chunks=[latest_chunk],
+        latest_hour_chunk=latest_chunk,
+    )
+
+
+def _sample_alpha_vantage_feature_frame(price_bars: pd.DataFrame) -> pd.DataFrame:
+    frame = price_bars.copy()
+    frame["return"] = frame["close"].pct_change().fillna(0.0)
+    frame["ma_short"] = frame["close"] - 0.25
+    frame["ma_long"] = frame["close"] - 1.0
+    frame["rsi"] = 62.0
+    frame["macd"] = 0.8
+    frame["macd_signal"] = 0.5
+    frame["rolling_volatility"] = 0.01
+    frame["buy_trigger"] = True
+    frame["sell_trigger"] = False
+    return frame
+
+
+def _seed_backtest_alpha_vantage_store(workflow: TradingWorkflow, symbol: str = "AAPL") -> None:
+    trading_days = [
+        candidate.isoformat()
+        for candidate in us_market_day_dates(workflow.data_collection.fetch_five_minute_history(symbol).index)
+    ]
+    for trading_day in trading_days:
+        workflow.result_store.save_alpha_vantage_indicator_snapshot(_snapshot_for_trading_day(trading_day, symbol=symbol))
+
+
+def _snapshot_for_trading_day(trading_day: str, *, symbol: str = "AAPL") -> AlphaVantageIndicatorSnapshot:
+    rows = [
+        {
+            "time": f"{trading_day} 11:00:00",
+            "RSI": 62.0,
+            "ADX": 22.0,
+            "threshold_hits": ["ADX_STRONG_TREND"],
+        },
+        {
+            "time": f"{trading_day} 11:05:00",
+            "RSI": 72.0,
+            "ADX": 28.0,
+            "threshold_hits": ["RSI_OVERBOUGHT", "ADX_STRONG_TREND"],
+        },
+        {
+            "time": f"{trading_day} 11:55:00",
+            "RSI": 68.0,
+            "ADX": 25.0,
+            "threshold_hits": ["ADX_STRONG_TREND"],
+        },
+    ]
+    latest_chunk = IndicatorHourChunk(
+        slot_start=f"{trading_day} 11:00:00",
+        slot_end=f"{trading_day} 11:55:00",
+        rows=rows,
+    )
+    return AlphaVantageIndicatorSnapshot(
+        symbol=symbol,
+        interval="5min",
+        trading_day=trading_day,
+        latest_timestamp=f"{trading_day} 11:55:00",
         indicator_columns=["RSI", "ADX"],
         rows=rows,
         hourly_chunks=[latest_chunk],
