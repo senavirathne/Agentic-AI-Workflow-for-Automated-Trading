@@ -204,6 +204,46 @@ def test_sqlalchemy_result_store_filters_cached_news_to_cutoff(tmp_path: Path) -
     assert [article.headline for article in loaded] == ["Before cutoff"]
 
 
+def test_sqlalchemy_result_store_tracks_news_query_fetches_by_provider_and_day(tmp_path: Path) -> None:
+    store = SQLAlchemyResultStore(f"sqlite:///{tmp_path / 'results.sqlite'}")
+
+    assert not store.has_news_query_fetch(
+        "AAPL",
+        "AAPL stock market news",
+        provider="alpha_vantage",
+        fetch_bucket="2026-04-02",
+    )
+
+    store.save_news_query_fetch(
+        "AAPL",
+        "AAPL stock market news",
+        provider="alpha_vantage",
+        fetch_bucket="2026-04-02",
+    )
+    store.save_news_query_fetch(
+        "AAPL",
+        "AAPL stock market news",
+        provider="alpha_vantage",
+        fetch_bucket="2026-04-02",
+    )
+
+    assert store.has_news_query_fetch(
+        "AAPL",
+        "AAPL stock market news",
+        provider="alpha_vantage",
+        fetch_bucket="2026-04-02",
+    )
+    assert not store.has_news_query_fetch(
+        "AAPL",
+        "AAPL stock market news",
+        provider="alpha_vantage",
+        fetch_bucket="2026-04-03",
+    )
+    with store.engine.begin() as connection:
+        fetch_count = connection.execute(sa.select(sa.func.count()).select_from(store.news_query_fetches_table)).scalar_one()
+    assert fetch_count == 1
+
+
 def test_azure_blob_raw_store_uses_factory_and_returns_blob_urls() -> None:
     service_client = _FakeBlobServiceClient()
     store = AzureBlobRawStore(

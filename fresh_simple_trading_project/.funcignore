@@ -4,3 +4,10 @@ __pycache__/
 .venv/
 notebooks/
 tests/
+custom-func-storage/
+data/
+dist/
+reports/
+scripts/
+src/
+venv/

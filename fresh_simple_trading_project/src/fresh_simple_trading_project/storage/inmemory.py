@@ -33,6 +33,7 @@ class InMemoryResultStore:
         self.alpha_vantage_indicator_snapshots: list[AlphaVantageIndicatorSnapshot] = []
         self.forecast_snapshots: list[ForecastSnapshot] = []
         self.cached_news: dict[tuple[str, str, str], NewsArticle] = {}
+        self.news_query_fetches: set[tuple[str, str, str, str]] = set()
 
     def save_workflow_run(
         self,
@@ -176,6 +177,26 @@ class InMemoryResultStore:
                 primary_ticker=article.primary_ticker,
                 primary_ticker_relevance=article.primary_ticker_relevance,
             )
+
+    def save_news_query_fetch(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        provider: str,
+        fetch_bucket: str,
+    ) -> None:
+        self.news_query_fetches.add((symbol.upper(), query, provider.strip().lower(), fetch_bucket))
+
+    def has_news_query_fetch(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        provider: str,
+        fetch_bucket: str,
+    ) -> bool:
+        return (symbol.upper(), query, provider.strip().lower(), fetch_bucket) in self.news_query_fetches
 
     def load_retrieved_news(
         self,

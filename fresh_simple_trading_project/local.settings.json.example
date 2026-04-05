@@ -1,0 +1,19 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FUNCTION_APP_STORAGE_ROOT": "./custom-func-storage",
+    "AZURE_SUBSCRIPTION_ID": "your-subscription-id",
+    "AZURE_VM_RESOURCE_GROUP": "your-vm-resource-group",
+    "AZURE_VM_NAME": "your-vm-name",
+    "VM_PROJECT_DIR": "/opt/fresh_simple_trading_project",
+    "VM_VENV_ACTIVATE": "/opt/fresh_simple_trading_project/.venv/bin/activate",
+    "VM_DEFAULT_SYMBOL": "AAPL",
+    "VM_DEFAULT_LOOPS": "1",
+    "VM_DEFAULT_MODE": "live",
+    "VM_TIMER_ENABLED": "false",
+    "VM_AUTO_SHUTDOWN": "true",
+    "VM_LOG_DIR": "/opt/fresh_simple_trading_project/logs"
+  }
+}

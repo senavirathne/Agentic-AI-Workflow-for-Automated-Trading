@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -344,6 +344,10 @@ class TradingWorkflow:
             trading_day=trading_day,
             interval=interval,
         )
+        if snapshot is None and self.alpha_vantage_service is not None:
+            snapshot = self.alpha_vantage_service.load_local_snapshot(symbol, trading_day=trading_day)
+            if snapshot is not None:
+                self.result_store.save_alpha_vantage_indicator_snapshot(snapshot)
         if snapshot is None:
             return None
 
@@ -525,6 +529,9 @@ class TradingWorkflow:
                 self._advance_replay_client(checkpoint)
                 print(f"\n[Workflow] Replaying checkpoint {checkpoint.isoformat()} for {target_symbol}...")
             else:
+                if not self._live_market_is_open():
+                    print("[Workflow] Live market is closed. Ending live loop.")
+                    break
                 checkpoint = self._next_live_checkpoint(target_symbol)
                 if checkpoint is None:
                     if effective_sleep_seconds > 0:
@@ -567,6 +574,9 @@ class TradingWorkflow:
                 break
             if effective_sleep_seconds > 0:
                 if mode == RunMode.LIVE:
+                    if not self._live_market_is_open():
+                        print("[Workflow] Live market is closed. Ending live loop.")
+                        break
                     wait_target = self._next_live_wait_target(target_symbol)
                     if wait_target is None:
                         wait_target = next_top_of_hour()
@@ -576,10 +586,25 @@ class TradingWorkflow:
                     )
                     sleep_until(wait_target, effective_sleep_seconds)
                 else:
-                    print(f"[Workflow] Sleeping for {effective_sleep_seconds:.1f}s...")
-                    sleep_until(next_top_of_hour(), effective_sleep_seconds)
+                    print(
+                        "[Workflow] Simulating the next backtest hour after "
+                        f"{effective_sleep_seconds:.1f}s..."
+                    )
+                    sleep_until(datetime.now(timezone.utc), effective_sleep_seconds)
 
         return results
+
+    def _live_market_is_open(self) -> bool:
+        if self.settings.trading.mode != RunMode.LIVE:
+            return True
+        if self.alpaca_service is None:
+            return True
+        try:
+            clock = self.alpaca_service.get_clock()
+        except Exception as exc:
+            print(f"[Workflow] Live market clock lookup failed: {exc}")
+            return True
+        return bool(getattr(clock, "is_open", True))
 
     def _should_execute_orders(self, execute_orders: bool) -> bool:
         return execute_orders or self.settings.trading.mode == RunMode.BACKTEST
@@ -607,16 +632,16 @@ class TradingWorkflow:
             f"[Workflow] Alpha Vantage backtest preflight: ensuring local storage coverage for {normalized_symbol} "
             f"across {trading_day_count} trading day(s) | db={database_path} | cache={cache_path}"
         )
-        missing_days = [
-            trading_day
-            for trading_day in required_trading_days
-            if self.result_store.load_alpha_vantage_indicator_snapshot(
-                normalized_symbol,
-                trading_day=trading_day,
-                interval=interval,
-            )
-            is None
-        ]
+        self._sync_backtest_alpha_vantage_snapshots_from_local_cache(
+            normalized_symbol,
+            required_trading_days=required_trading_days,
+            interval=interval,
+        )
+        missing_days = self._missing_backtest_alpha_vantage_snapshot_days(
+            normalized_symbol,
+            required_trading_days=required_trading_days,
+            interval=interval,
+        )
         if missing_days:
             self.alpha_vantage_service.ensure_data_for_window(
                 normalized_symbol,
@@ -624,27 +649,121 @@ class TradingWorkflow:
                 end_time=end_time,
                 required_trading_days=required_trading_days,
             )
-            missing_days = [
-                trading_day
-                for trading_day in required_trading_days
-                if self.result_store.load_alpha_vantage_indicator_snapshot(
-                    normalized_symbol,
-                    trading_day=trading_day,
-                    interval=interval,
-                )
-                is None
-            ]
-        if missing_days:
-            raise RuntimeError(
-                "Alpha Vantage backtest data is still missing from the local store after preload. "
-                f"Missing {normalized_symbol} {interval} trading day snapshots: {missing_days}. "
-                f"DB path: {database_path}"
+            self._sync_backtest_alpha_vantage_snapshots_from_local_cache(
+                normalized_symbol,
+                required_trading_days=required_trading_days,
+                interval=interval,
             )
-        print(
-            "[Workflow] Alpha Vantage backtest preload finished: required indicator snapshots and 1-hour chunks "
-            f"are available in the local store at {database_path}."
-        )
+            missing_days = self._missing_backtest_alpha_vantage_snapshot_days(
+                normalized_symbol,
+                required_trading_days=required_trading_days,
+                interval=interval,
+            )
+        if missing_days:
+            partial_coverage = self._resolve_backtest_alpha_vantage_partial_coverage(
+                normalized_symbol,
+                required_trading_days=required_trading_days,
+                interval=interval,
+            )
+            if partial_coverage is None:
+                raise RuntimeError(
+                    "Alpha Vantage backtest data is still missing from the local store after preload. "
+                    f"Missing {normalized_symbol} {interval} trading day snapshots: {missing_days}. "
+                    f"DB path: {database_path}"
+                )
+            latest_snapshot, trailing_missing_days = partial_coverage
+            latest_timestamp = _as_utc_timestamp(latest_snapshot.latest_timestamp)
+            print(
+                "[Workflow] Alpha Vantage backtest preload accepted partial local coverage: "
+                f"using the latest available snapshot through {latest_timestamp.isoformat()} "
+                f"and skipping trailing unavailable trading day(s): {trailing_missing_days}."
+            )
+        else:
+            print(
+                "[Workflow] Alpha Vantage backtest preload finished: required indicator snapshots and 1-hour chunks "
+                f"are available in the local store at {database_path}."
+            )
         self._alpha_vantage_preloaded_symbols.add(normalized_symbol)
+
+    def _missing_backtest_alpha_vantage_snapshot_days(
+        self,
+        symbol: str,
+        *,
+        required_trading_days: list[str],
+        interval: str,
+    ) -> list[str]:
+        return [
+            trading_day
+            for trading_day in required_trading_days
+            if self.result_store.load_alpha_vantage_indicator_snapshot(
+                symbol,
+                trading_day=trading_day,
+                interval=interval,
+            )
+            is None
+        ]
+
+    def _sync_backtest_alpha_vantage_snapshots_from_local_cache(
+        self,
+        symbol: str,
+        *,
+        required_trading_days: list[str],
+        interval: str,
+    ) -> list[str]:
+        if self.alpha_vantage_service is None:
+            return []
+
+        hydrated_days: list[str] = []
+        for trading_day in required_trading_days:
+            existing = self.result_store.load_alpha_vantage_indicator_snapshot(
+                symbol,
+                trading_day=trading_day,
+                interval=interval,
+            )
+            if existing is not None:
+                continue
+            snapshot = self.alpha_vantage_service.load_local_snapshot(symbol, trading_day=trading_day)
+            if snapshot is None:
+                continue
+            self.result_store.save_alpha_vantage_indicator_snapshot(snapshot)
+            hydrated_days.append(trading_day)
+
+        if hydrated_days:
+            print(
+                "[Workflow] Alpha Vantage backtest cache sync: hydrated "
+                f"{len(hydrated_days)} trading day snapshot(s) from local cache/storage into the result store. "
+                f"Trading days: {hydrated_days}"
+            )
+        return hydrated_days
+
+    def _resolve_backtest_alpha_vantage_partial_coverage(
+        self,
+        symbol: str,
+        *,
+        required_trading_days: list[str],
+        interval: str,
+    ) -> tuple[AlphaVantageIndicatorSnapshot, list[str]] | None:
+        first_missing_index: int | None = None
+        latest_covered_snapshot: AlphaVantageIndicatorSnapshot | None = None
+
+        for index, trading_day in enumerate(required_trading_days):
+            snapshot = self.result_store.load_alpha_vantage_indicator_snapshot(
+                symbol,
+                trading_day=trading_day,
+                interval=interval,
+            )
+            if snapshot is None:
+                if first_missing_index is None:
+                    first_missing_index = index
+                continue
+            if first_missing_index is not None:
+                return None
+            latest_covered_snapshot = snapshot
+
+        if first_missing_index is None or first_missing_index == 0 or latest_covered_snapshot is None:
+            return None
+
+        return latest_covered_snapshot, required_trading_days[first_missing_index:]
 
     def _required_backtest_alpha_vantage_trading_days(self, timestamps: pd.Index) -> list[str]:
         if timestamps.empty:
@@ -663,8 +782,7 @@ class TradingWorkflow:
         latest_source_timestamp = _as_utc_timestamp(source_bars.index.max())
         if not self._uses_backtest_alpha_vantage_indicators():
             return latest_source_timestamp
-        interval = self.settings.alpha_vantage.interval or "5min"
-        latest_snapshot = self.result_store.load_alpha_vantage_indicator_snapshot(symbol, interval=interval)
+        latest_snapshot = self.alpha_vantage_service.load_local_snapshot(symbol)
         if latest_snapshot is None:
             return latest_source_timestamp
         latest_indicator_timestamp = _as_utc_timestamp(latest_snapshot.latest_timestamp)
@@ -754,6 +872,12 @@ class TradingWorkflow:
             days=self.settings.trading.sr_lookback_days
         )
         earliest_checkpoint = max(earliest_indicator_checkpoint, earliest_sr_checkpoint)
+        last_processed = self.result_store.load_last_processed(symbol)
+        if last_processed is not None:
+            earliest_checkpoint = max(
+                earliest_checkpoint,
+                _as_utc_timestamp(last_processed) + pd.Timedelta(hours=1),
+            )
         latest_checkpoint_cap = self._latest_backtest_available_timestamp(symbol)
         checkpoints = _hourly_checkpoints(source_five_minute_bars)
         return [

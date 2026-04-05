@@ -4,3 +4,8 @@ data/
 reports/
 src/fresh_simple_trading_project.egg-info/
 .env
+
+.python_packages
+venv
+local.settings.json
+dist/

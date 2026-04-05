@@ -273,6 +273,46 @@ class AlphaVantageIndicatorService:
 
         return _snapshot_from_frame(normalized_symbol, interval, current)
 
+    def load_local_snapshot(
+        self,
+        symbol: str,
+        *,
+        trading_day: str | None = None,
+        end_time: pd.Timestamp | str | None = None,
+    ) -> AlphaVantageIndicatorSnapshot | None:
+        """Load a locally available snapshot without triggering a network refresh."""
+
+        if trading_day is not None and end_time is not None:
+            raise ValueError("Provide either trading_day or end_time when loading a local Alpha Vantage snapshot.")
+
+        interval = self.config.interval or DEFAULT_INTERVAL
+        normalized_symbol = symbol.upper()
+
+        if end_time is not None:
+            requested_day = _requested_trading_day(end_time)
+            snapshot = self._load_snapshot_for_trading_day(
+                normalized_symbol,
+                interval,
+                requested_day,
+                allow_aligned_cache=True,
+            )
+            if snapshot is None:
+                return None
+            current = _slice_to_timestamp(_snapshot_to_frame(snapshot), end_time=end_time)
+            if current.empty:
+                return None
+            return _snapshot_from_frame(normalized_symbol, interval, current)
+
+        if trading_day is not None:
+            return self._load_snapshot_for_trading_day(
+                normalized_symbol,
+                interval,
+                trading_day,
+                allow_aligned_cache=True,
+            )
+
+        return self._load_latest_snapshot(normalized_symbol, interval)
+
     def build_indicator_frame(
         self,
         symbol: str,

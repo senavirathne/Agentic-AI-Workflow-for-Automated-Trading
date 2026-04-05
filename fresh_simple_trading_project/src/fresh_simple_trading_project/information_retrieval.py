@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -98,6 +98,8 @@ class AlphaVantageNewsSearchClient:
     base_url: str = "https://www.alphavantage.co/query"
     max_age_days: int = 7
     http_get: object = requests.get
+    _last_request_succeeded: bool = field(default=False, init=False, repr=False)
+    _last_request_cacheable: bool = field(default=False, init=False, repr=False)
 
     def search_news(
         self,
@@ -106,6 +108,8 @@ class AlphaVantageNewsSearchClient:
         *,
         input_size_chars: int | None = None,
     ) -> list[NewsArticle]:
+        self._last_request_succeeded = False
+        self._last_request_cacheable = False
         try:
             params = self._build_query_params(query, limit=limit, input_size_chars=input_size_chars)
             if params is None:
@@ -118,11 +122,31 @@ class AlphaVantageNewsSearchClient:
             if "Error Message" in payload:
                 raise ValueError(payload["Error Message"])
             if "Note" in payload or "Information" in payload:
-                raise ValueError(payload.get("Note") or payload.get("Information") or "Alpha Vantage request failed.")
+                self._last_request_cacheable = True
+                logger.info(
+                    "Alpha Vantage news request returned an informational/rate-limit response for query %r. "
+                    "Reusing any available cached news.",
+                    query,
+                )
+                return []
+            self._last_request_succeeded = True
+            self._last_request_cacheable = True
             return _parse_alpha_vantage_news_feed(payload, limit=limit)
         except Exception as exc:  # pragma: no cover - external API behavior varies by environment.
             logger.warning("Alpha Vantage news search failed for query %r: %s", query, exc)
             return []
+
+    @property
+    def last_request_succeeded(self) -> bool:
+        """Report whether the most recent Alpha Vantage request completed successfully."""
+
+        return self._last_request_succeeded
+
+    @property
+    def last_request_cacheable(self) -> bool:
+        """Report whether the most recent Alpha Vantage response should suppress same-day refetches."""
+
+        return self._last_request_cacheable
 
     def _build_query_params(
         self,
@@ -276,6 +300,8 @@ class InformationRetrievalModule:
             news_summary.summary_note if news_summary is not None else None,
             max_chars=NEWS_AGENT_MAX_SUMMARY_CHARS,
         )
+        if summary_note is None:
+            summary_note = _fallback_news_summary(articles)
         critical_news = _compress_text_list(
             news_summary.critical_news if news_summary and news_summary.critical_news else [],
             max_items=NEWS_AGENT_MAX_CRITICAL_ITEMS,
@@ -305,18 +331,21 @@ class InformationRetrievalModule:
         input_size_chars: int,
         published_at_lte: datetime | str | None,
     ) -> list[NewsArticle]:
+        fetch_bucket = _news_fetch_bucket(published_at_lte)
         live_articles = _filter_articles_published_at_lte(
             _sort_articles_newest_first(
-                self.news_client.search_news(
+                self._search_live_news(
+                    symbol,
                     query,
                     limit=limit,
                     input_size_chars=input_size_chars,
+                    fetch_bucket=fetch_bucket,
                 )
             ),
             published_at_lte=published_at_lte,
         )
         if self.news_archive is None:
-            return _filter_articles_for_decision_context(live_articles, symbol)
+            return _filter_articles_for_decision_context(live_articles, symbol, query=query)
 
         if live_articles:
             self.news_archive.save_retrieved_news(symbol, query, live_articles)
@@ -327,8 +356,82 @@ class InformationRetrievalModule:
             published_at_lte=published_at_lte,
         )
         if cached_articles:
-            return _sort_articles_newest_first(_filter_articles_for_decision_context(cached_articles, symbol))
-        return _filter_articles_for_decision_context(live_articles, symbol)
+            return _sort_articles_newest_first(_filter_articles_for_decision_context(cached_articles, symbol, query=query))
+        return _filter_articles_for_decision_context(live_articles, symbol, query=query)
+
+    def _search_live_news(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        limit: int,
+        input_size_chars: int,
+        fetch_bucket: str,
+    ) -> list[NewsArticle]:
+        if isinstance(self.news_client, CombinedNewsSearchClient):
+            merged: list[NewsArticle] = []
+            seen: set[str] = set()
+            for client in self.news_client.clients:
+                for article in self._search_live_news_client(
+                    client,
+                    symbol,
+                    query,
+                    limit=limit,
+                    input_size_chars=input_size_chars,
+                    fetch_bucket=fetch_bucket,
+                ):
+                    key = _combined_article_key(article)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(article)
+            return merged
+        return self._search_live_news_client(
+            self.news_client,
+            symbol,
+            query,
+            limit=limit,
+            input_size_chars=input_size_chars,
+            fetch_bucket=fetch_bucket,
+        )
+
+    def _search_live_news_client(
+        self,
+        client: NewsSearchClient,
+        symbol: str,
+        query: str,
+        *,
+        limit: int,
+        input_size_chars: int,
+        fetch_bucket: str,
+    ) -> list[NewsArticle]:
+        if isinstance(client, AlphaVantageNewsSearchClient) and self.news_archive is not None:
+            if self.news_archive.has_news_query_fetch(
+                symbol,
+                query,
+                provider="alpha_vantage",
+                fetch_bucket=fetch_bucket,
+            ):
+                return []
+
+        articles = client.search_news(
+            query,
+            limit=limit,
+            input_size_chars=input_size_chars,
+        )
+
+        if (
+            isinstance(client, AlphaVantageNewsSearchClient)
+            and self.news_archive is not None
+            and client.last_request_cacheable
+        ):
+            self.news_archive.save_news_query_fetch(
+                symbol,
+                query,
+                provider="alpha_vantage",
+                fetch_bucket=fetch_bucket,
+            )
+        return articles
 
     def _summarize_with_llm(
         self,
@@ -495,7 +598,25 @@ def _compress_text_list(
     return compressed
 
 
-def _filter_articles_for_decision_context(articles: list[NewsArticle], symbol: str) -> list[NewsArticle]:
+def _fallback_news_summary(articles: list[NewsArticle]) -> str | None:
+    """Create a compact fallback summary when no news-agent text is available."""
+
+    if not articles:
+        return None
+    top_headlines = [article.headline.strip() for article in articles[:NEWS_AGENT_MAX_CRITICAL_ITEMS] if article.headline.strip()]
+    if not top_headlines:
+        return None
+    return _compress_text(
+        f"Latest available news: {'; '.join(top_headlines)}",
+        max_chars=NEWS_AGENT_MAX_SUMMARY_CHARS,
+    )
+
+
+def _filter_articles_for_decision_context(articles: list[NewsArticle], symbol: str, *, query: str) -> list[NewsArticle]:
+    symbol_query = SYMBOL_NEWS_QUERY_TEMPLATE.format(symbol=symbol.upper())
+    if query != symbol_query:
+        return list(articles)
+
     target_symbol = symbol.upper()
     filtered: list[NewsArticle] = []
     for article in articles:
@@ -524,6 +645,16 @@ def _filter_articles_published_at_lte(
         if published_at is None or published_at <= cutoff:
             filtered.append(article)
     return filtered
+
+
+def _news_fetch_bucket(published_at_lte: datetime | str | None) -> str:
+    """Group persisted news fetches by UTC calendar day."""
+
+    if published_at_lte is not None:
+        cutoff = _parse_published_at(str(published_at_lte))
+        if cutoff is not None:
+            return cutoff.date().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _article_key(article: NewsArticle) -> str:

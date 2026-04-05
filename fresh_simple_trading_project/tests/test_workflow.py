@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +19,7 @@ from fresh_simple_trading_project.agents import (
 )
 from fresh_simple_trading_project.data_collection import (
     DataCollectionModule,
+    HistoricalReplayDataClient,
     SimulatedAccountClient,
     StaticMarketDataClient,
 )
@@ -252,6 +253,72 @@ def test_backtest_preloads_missing_alpha_vantage_snapshots_into_local_store(tmp_
     )
 
 
+def test_backtest_hydrates_cached_alpha_vantage_snapshots_into_local_store(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    trading_days = [
+        candidate.isoformat()
+        for candidate in us_market_day_dates(workflow.data_collection.fetch_five_minute_history("AAPL").index)
+    ]
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        result_store=workflow.result_store,
+        populate_store=False,
+        local_snapshots={trading_day: _snapshot_for_trading_day(trading_day) for trading_day in trading_days},
+    )
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    assert result.alpha_vantage_indicator_snapshot is not None
+    assert workflow.alpha_vantage_service.ensure_window_calls == []
+    assert all(
+        workflow.result_store.load_alpha_vantage_indicator_snapshot("AAPL", trading_day=trading_day, interval="5min")
+        is not None
+        for trading_day in trading_days
+    )
+
+
+def test_backtest_accepts_latest_available_alpha_vantage_data_when_newest_days_are_missing(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    trading_days = [
+        candidate.isoformat()
+        for candidate in us_market_day_dates(workflow.data_collection.fetch_five_minute_history("AAPL").index)
+    ]
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        result_store=workflow.result_store,
+        populate_store=False,
+        local_snapshots={
+            trading_days[0]: _snapshot_for_trading_day(trading_days[0]),
+            trading_days[1]: _snapshot_for_trading_day(trading_days[1]),
+        },
+    )
+
+    result = workflow.run_once(symbol="AAPL", execute_orders=False)
+
+    assert result.alpha_vantage_indicator_snapshot is not None
+    assert result.alpha_vantage_indicator_snapshot.trading_day == trading_days[1]
+    assert pd.Timestamp(result.analysis.timestamp) == pd.Timestamp(f"{trading_days[1]}T11:55:00Z")
+    assert len(workflow.alpha_vantage_service.ensure_window_calls) == 1
+    assert workflow.result_store.load_alpha_vantage_indicator_snapshot(
+        "AAPL",
+        trading_day=trading_days[1],
+        interval="5min",
+    ) is not None
+    assert workflow.result_store.load_alpha_vantage_indicator_snapshot(
+        "AAPL",
+        trading_day=trading_days[-1],
+        interval="5min",
+    ) is None
+
+
 def test_backtest_uses_explicit_price_lookup_method(tmp_path: Path) -> None:
     workflow = _build_workflow(tmp_path)
     workflow.settings = replace(
@@ -278,6 +345,27 @@ def test_backtest_raises_when_alpha_vantage_preload_does_not_fill_local_store(tm
     workflow.alpha_vantage_service = StubAlphaVantageService(
         _sample_alpha_vantage_snapshot(),
         populate_store=False,
+    )
+
+    with pytest.raises(RuntimeError, match="DB path"):
+        workflow.run_once(symbol="AAPL", execute_orders=False)
+
+
+def test_backtest_raises_when_alpha_vantage_gap_precedes_latest_available_day(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    trading_days = [
+        candidate.isoformat()
+        for candidate in us_market_day_dates(workflow.data_collection.fetch_five_minute_history("AAPL").index)
+    ]
+    workflow.alpha_vantage_service = StubAlphaVantageService(
+        _sample_alpha_vantage_snapshot(),
+        result_store=workflow.result_store,
+        populate_store=False,
+        local_snapshots={trading_days[-1]: _snapshot_for_trading_day(trading_days[-1])},
     )
 
     with pytest.raises(RuntimeError, match="DB path"):
@@ -548,7 +636,7 @@ def test_format_reasoning_lines_show_agent_outputs_and_placeholders(tmp_path: Pa
     assert "Data Window:" in lines[0]
     assert "Alpha Vantage: <not configured>" in lines[1]
     assert "Technical Agent: <no output returned>" in lines[2]
-    assert "News Agent: <no output returned>" in lines[3]
+    assert "News Agent: Latest available news:" in lines[3]
     assert "Risk Agent: <no output returned>" in lines[4]
     assert any(line.startswith("  Decision Reason") for line in lines)
 
@@ -621,6 +709,85 @@ def test_live_run_loop_waits_for_delayed_hourly_checkpoint(monkeypatch, tmp_path
     assert sleep_targets == [(pd.Timestamp("2025-01-03T12:15:00Z").to_pydatetime(), 0.25)]
 
 
+def test_live_run_loop_stops_immediately_when_market_is_closed(tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.LIVE),
+    )
+    workflow.alpaca_service = StubClockService([False])
+
+    results = workflow.run_loop(symbol="AAPL", execute_orders=False, max_iterations=3, sleep_seconds=0.0)
+
+    assert results == []
+
+
+def test_live_run_loop_stops_after_current_iteration_when_market_closes(monkeypatch, tmp_path: Path) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.LIVE),
+    )
+    workflow.alpaca_service = StubClockService([True, False])
+    sleep_targets: list[tuple[object, float | None]] = []
+
+    monkeypatch.setattr(
+        workflow_module,
+        "sleep_until",
+        lambda target, sleep_seconds=None: sleep_targets.append((target, sleep_seconds)),
+    )
+
+    results = workflow.run_loop(symbol="AAPL", execute_orders=False, max_iterations=3, sleep_seconds=0.25)
+
+    assert len(results) == 1
+    assert sleep_targets == []
+
+
+def test_backtest_run_loop_sleeps_briefly_without_using_live_hour_target(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    workflow = _build_workflow(tmp_path)
+    workflow.settings = replace(
+        workflow.settings,
+        trading=replace(workflow.settings.trading, mode=RunMode.BACKTEST),
+    )
+    workflow.data_collection = DataCollectionModule(
+        market_data_client=HistoricalReplayDataClient(
+            five_min_history=_make_backtest_bars(),
+            hourly_history=pd.DataFrame(),
+        ),
+        account_client=SimulatedAccountClient(cash=workflow.settings.trading.starting_cash),
+    )
+    sleep_targets: list[tuple[object, float | None]] = []
+    simulated_now = datetime(2025, 1, 3, 12, 34, tzinfo=timezone.utc)
+
+    class StopLoop(RuntimeError):
+        pass
+
+    class FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            return simulated_now if tz is not None else simulated_now.replace(tzinfo=None)
+
+    def fake_sleep_until(target, sleep_seconds=None):
+        sleep_targets.append((target, sleep_seconds))
+        raise StopLoop
+
+    monkeypatch.setattr(workflow_module, "datetime", FakeDatetime)
+    monkeypatch.setattr(
+        workflow_module,
+        "next_top_of_hour",
+        lambda: (_ for _ in ()).throw(AssertionError("backtest should not wait for the next real hour")),
+    )
+    monkeypatch.setattr(workflow_module, "sleep_until", fake_sleep_until)
+
+    with pytest.raises(StopLoop):
+        workflow.run_loop(symbol="AAPL", execute_orders=False, max_iterations=2, sleep_seconds=0.25)
+
+    assert sleep_targets == [(simulated_now, 0.25)]
+
+
 def _build_workflow(tmp_path: Path, llm_client: TextGenerationClient | None = None) -> TradingWorkflow:
     settings = Settings.from_env(project_root=tmp_path)
     technical_agent = None if llm_client is None else TechnicalAnalysisAgent(llm_client=llm_client)
@@ -671,6 +838,21 @@ def _make_uptrend_bars() -> pd.DataFrame:
     )
 
 
+def _make_backtest_bars() -> pd.DataFrame:
+    index = pd.date_range("2025-01-01", periods=3_000, freq="5min", tz="UTC")
+    base = np.linspace(100.0, 180.0, num=len(index))
+    return pd.DataFrame(
+        {
+            "open": base - 0.5,
+            "high": base + 1.0,
+            "low": base - 1.0,
+            "close": base,
+            "volume": np.full(len(index), 50_000),
+        },
+        index=index,
+    )
+
+
 def _expected_technical_prefix() -> str:
     return "As of 2025-01-03T11:55:00Z, AAPL current price is $160.00."
 
@@ -705,11 +887,13 @@ class StubAlphaVantageService:
         *,
         result_store=None,
         populate_store: bool = True,
+        local_snapshots: dict[str, AlphaVantageIndicatorSnapshot] | None = None,
     ) -> None:
         self.snapshot = snapshot
         self.feature_frame = feature_frame
         self.result_store = result_store
         self.populate_store = populate_store
+        self.local_snapshots = {} if local_snapshots is None else dict(local_snapshots)
         self.ensure_window_calls: list[tuple[str, pd.Timestamp, pd.Timestamp]] = []
         self.snapshot_calls: list[tuple[str, pd.Timestamp | str | None]] = []
         self.feature_frame_calls: list[tuple[str, pd.Timestamp | str | None]] = []
@@ -743,6 +927,37 @@ class StubAlphaVantageService:
                 )
         return True
 
+    def load_local_snapshot(
+        self,
+        symbol: str,
+        *,
+        trading_day: str | None = None,
+        end_time: pd.Timestamp | str | None = None,
+    ) -> AlphaVantageIndicatorSnapshot | None:
+        normalized_symbol = symbol.upper()
+        if trading_day is None and end_time is not None:
+            trading_day = pd.Timestamp(end_time).date().isoformat()
+
+        if trading_day is not None:
+            snapshot = None
+            if self.result_store is not None:
+                snapshot = self.result_store.load_alpha_vantage_indicator_snapshot(
+                    normalized_symbol,
+                    trading_day=trading_day,
+                    interval="5min",
+                )
+            if snapshot is None:
+                snapshot = self.local_snapshots.get(trading_day)
+            return snapshot
+
+        if self.result_store is not None:
+            snapshot = self.result_store.load_alpha_vantage_indicator_snapshot(normalized_symbol, interval="5min")
+            if snapshot is not None:
+                return snapshot
+        if not self.local_snapshots:
+            return None
+        return max(self.local_snapshots.values(), key=lambda candidate: (candidate.trading_day, candidate.latest_timestamp))
+
     def build_snapshot(
         self,
         symbol: str,
@@ -772,6 +987,15 @@ class StubLivePriceService:
 
     def get_current_price(self, symbol: str) -> float:
         return self.current_price
+
+
+class StubClockService:
+    def __init__(self, open_states: list[bool]) -> None:
+        self.open_states = list(open_states)
+
+    def get_clock(self):
+        is_open = self.open_states.pop(0) if self.open_states else False
+        return type("Clock", (), {"is_open": is_open})()
 
 
 class RecordingPriceMarketDataClient(StaticMarketDataClient):

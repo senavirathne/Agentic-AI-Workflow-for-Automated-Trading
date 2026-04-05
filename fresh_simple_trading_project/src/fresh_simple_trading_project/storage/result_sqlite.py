@@ -130,6 +130,30 @@ class SQLiteResultStore:
             sa.Index("ix_retrieved_news_symbol_query_published_at", "symbol", "query", "published_at"),
             sa.Index("ix_retrieved_news_published_at", "published_at"),
         )
+        self.news_query_fetches_table = sa.Table(
+            "news_query_fetches",
+            self._metadata,
+            sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+            sa.Column("symbol", sa.String(32), nullable=False),
+            sa.Column("query", sa.String(512), nullable=False),
+            sa.Column("provider", sa.String(64), nullable=False),
+            sa.Column("fetch_bucket", sa.String(16), nullable=False),
+            sa.Column("fetched_at", sa.String(32), nullable=False),
+            sa.UniqueConstraint(
+                "symbol",
+                "query",
+                "provider",
+                "fetch_bucket",
+                name="uq_news_query_fetches_symbol_query_provider_bucket",
+            ),
+            sa.Index(
+                "ix_news_query_fetches_symbol_query_provider_bucket",
+                "symbol",
+                "query",
+                "provider",
+                "fetch_bucket",
+            ),
+        )
         create_engine = engine_factory or _default_sqlalchemy_engine_factory
         self.engine = create_engine(database_url)
         self._metadata.create_all(self.engine)
@@ -462,6 +486,47 @@ class SQLiteResultStore:
                     connection.execute(sa.insert(self.retrieved_news_table).values(**row))
                 except sa.exc.IntegrityError:
                     continue
+
+    def save_news_query_fetch(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        provider: str,
+        fetch_bucket: str,
+    ) -> None:
+        row = {
+            "symbol": symbol.upper(),
+            "query": query,
+            "provider": provider.strip().lower(),
+            "fetch_bucket": fetch_bucket,
+            "fetched_at": _utc_now_text(),
+        }
+        with self.engine.begin() as connection:
+            try:
+                connection.execute(sa.insert(self.news_query_fetches_table).values(**row))
+            except sa.exc.IntegrityError:
+                return
+
+    def has_news_query_fetch(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        provider: str,
+        fetch_bucket: str,
+    ) -> bool:
+        statement = (
+            sa.select(self.news_query_fetches_table.c.id)
+            .where(self.news_query_fetches_table.c.symbol == symbol.upper())
+            .where(self.news_query_fetches_table.c.query == query)
+            .where(self.news_query_fetches_table.c.provider == provider.strip().lower())
+            .where(self.news_query_fetches_table.c.fetch_bucket == fetch_bucket)
+            .limit(1)
+        )
+        with self.engine.begin() as connection:
+            row = connection.execute(statement).first()
+        return row is not None
 
     def load_retrieved_news(
         self,

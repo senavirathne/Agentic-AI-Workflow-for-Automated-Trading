@@ -309,6 +309,28 @@ def test_news_agent_prompt_mentions_macro_and_market_search_focus() -> None:
     assert "Rule-based sentiment score" not in prompt
 
 
+def test_retrieve_builds_fallback_summary_from_latest_available_news_when_agent_is_absent() -> None:
+    client = RecordingNewsSearchClient(
+        {
+            "AAPL stock market news": [NewsArticle(headline="AAPL launches a new product", source="Symbol Wire")],
+            "American economy inflation interest rates jobs GDP Federal Reserve": [
+                NewsArticle(headline="American economy shows cooling inflation", source="Macro Wire")
+            ],
+            "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth": [
+                NewsArticle(headline="S&P 500 and Nasdaq extend broad market rally", source="Market Wire")
+            ],
+        }
+    )
+    module = InformationRetrievalModule(client)
+
+    result = module.retrieve("AAPL", limit=6)
+
+    assert result.summary_note == (
+        "Latest available news: AAPL launches a new product; American economy shows cooling inflation; "
+        "S&P 500 and Nasdaq extend broad market rally"
+    )
+
+
 def test_news_agent_uses_structured_llm_output_for_critical_news() -> None:
     client = RecordingNewsSearchClient(
         {
@@ -474,6 +496,155 @@ def test_retrieve_uses_cached_news_history_to_fill_input_budget() -> None:
         "Live article",
         "Cached article 0",
         "Cached article 1",
+    ]
+
+
+def test_retrieve_calls_alpha_vantage_news_once_per_day_and_reuses_stored_articles() -> None:
+    archive = InMemoryResultStore()
+    calls: list[dict] = []
+
+    def fake_http_get(_url: str, *, params: dict, timeout: int) -> FakeAlphaVantageResponse:
+        del timeout
+        calls.append(dict(params))
+        if params.get("tickers") == "AAPL":
+            feed = [
+                {
+                    "title": "Fresh AAPL article",
+                    "summary": "Alpha Vantage symbol-specific article.",
+                    "source": "Alpha Wire",
+                    "url": "https://example.com/aapl-fresh",
+                    "time_published": "20260402T120000",
+                    "ticker_sentiment": [{"ticker": "AAPL", "relevance_score": "0.91"}],
+                }
+            ]
+        elif params.get("topics") == "economy_macro,economy_monetary,economy_fiscal":
+            feed = [
+                {
+                    "title": "Fresh macro article",
+                    "summary": "Macro backdrop update.",
+                    "source": "Alpha Wire",
+                    "url": "https://example.com/macro-fresh",
+                    "time_published": "20260402T110000",
+                }
+            ]
+        else:
+            feed = [
+                {
+                    "title": "Fresh market article",
+                    "summary": "Market breadth update.",
+                    "source": "Alpha Wire",
+                    "url": "https://example.com/market-fresh",
+                    "time_published": "20260402T100000",
+                }
+            ]
+        return FakeAlphaVantageResponse({"feed": feed})
+
+    module = InformationRetrievalModule(
+        AlphaVantageNewsSearchClient(
+            api_key="ABCDEFGHI1234",
+            max_age_days=7,
+            http_get=fake_http_get,
+        ),
+        news_archive=archive,
+    )
+
+    first = module.retrieve("AAPL", limit=6, published_at_lte="2026-04-02T20:00:00Z")
+    second = module.retrieve("AAPL", limit=6, published_at_lte="2026-04-02T20:00:00Z")
+
+    assert len(calls) == 3
+    assert [article.headline for article in first.articles] == [
+        "Fresh AAPL article",
+        "Fresh macro article",
+        "Fresh market article",
+    ]
+    assert [article.headline for article in second.articles] == [
+        "Fresh AAPL article",
+        "Fresh macro article",
+        "Fresh market article",
+    ]
+
+
+def test_retrieve_reuses_latest_cached_news_when_alpha_vantage_hits_free_key_limit() -> None:
+    archive = InMemoryResultStore()
+    queries = [
+        "AAPL stock market news",
+        "American economy inflation interest rates jobs GDP Federal Reserve",
+        "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth",
+    ]
+    archive.save_retrieved_news(
+        "AAPL",
+        queries[0],
+        [
+            NewsArticle(
+                headline="Cached symbol article",
+                summary="Previously stored symbol news.",
+                source="Archive Wire",
+                url="https://example.com/cached-symbol",
+                published_at="2026-04-01T12:00:00Z",
+                provider="alpha_vantage",
+                primary_ticker="AAPL",
+                primary_ticker_relevance=0.94,
+            )
+        ],
+    )
+    archive.save_retrieved_news(
+        "AAPL",
+        queries[1],
+        [
+            NewsArticle(
+                headline="Cached macro article",
+                summary="Previously stored macro news.",
+                source="Archive Wire",
+                url="https://example.com/cached-macro",
+                published_at="2026-04-01T11:00:00Z",
+                provider="alpha_vantage",
+            )
+        ],
+    )
+    archive.save_retrieved_news(
+        "AAPL",
+        queries[2],
+        [
+            NewsArticle(
+                headline="Cached market article",
+                summary="Previously stored market news.",
+                source="Archive Wire",
+                url="https://example.com/cached-market",
+                published_at="2026-04-01T10:00:00Z",
+                provider="alpha_vantage",
+            )
+        ],
+    )
+
+    calls: list[dict] = []
+
+    def fake_http_get(_url: str, *, params: dict, timeout: int) -> FakeAlphaVantageResponse:
+        del timeout
+        calls.append(dict(params))
+        return FakeAlphaVantageResponse({"Note": "Thank you for using Alpha Vantage! Our standard API rate limit is 25 requests per day."})
+
+    module = InformationRetrievalModule(
+        AlphaVantageNewsSearchClient(
+            api_key="ABCDEFGHI1234",
+            max_age_days=7,
+            http_get=fake_http_get,
+        ),
+        news_archive=archive,
+    )
+
+    first = module.retrieve("AAPL", limit=6, published_at_lte="2026-04-02T20:00:00Z")
+    second = module.retrieve("AAPL", limit=6, published_at_lte="2026-04-02T20:00:00Z")
+
+    assert len(calls) == 3
+    assert [article.headline for article in first.articles] == [
+        "Cached symbol article",
+        "Cached macro article",
+        "Cached market article",
+    ]
+    assert [article.headline for article in second.articles] == [
+        "Cached symbol article",
+        "Cached macro article",
+        "Cached market article",
     ]
 
 

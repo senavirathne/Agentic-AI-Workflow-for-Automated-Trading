@@ -107,6 +107,26 @@ class ResultStore(Protocol):
     def save_retrieved_news(self, symbol: str, query: str, articles: list[NewsArticle]) -> None:
         ...
 
+    def save_news_query_fetch(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        provider: str,
+        fetch_bucket: str,
+    ) -> None:
+        ...
+
+    def has_news_query_fetch(
+        self,
+        symbol: str,
+        query: str,
+        *,
+        provider: str,
+        fetch_bucket: str,
+    ) -> bool:
+        ...
+
     def load_retrieved_news(
         self,
         symbol: str,

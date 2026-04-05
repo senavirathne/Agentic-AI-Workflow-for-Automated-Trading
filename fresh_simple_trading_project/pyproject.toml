@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
-azure = ["azure-identity", "azure-storage-blob"]
+azure = ["azure-identity", "azure-mgmt-compute", "azure-storage-blob"]
 
 [project.scripts]
 fresh-trader = "fresh_simple_trading_project.cli:main"
