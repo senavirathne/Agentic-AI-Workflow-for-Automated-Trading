@@ -327,7 +327,7 @@ def _build_run_command_script(
     quoted_runner_script = shlex.quote(runner_script)
     quoted_log_file = shlex.quote(log_file_path)
     return [
-        "set -euo pipefail",
+        "set -eu",
         f"nohup bash -lc {quoted_runner_script} >/dev/null 2>&1 </dev/null &",
         "runner_pid=$!",
         f"for _ in $(seq 1 {RUN_COMMAND_LOG_FILE_WAIT_SECONDS}); do",
@@ -406,7 +406,7 @@ def _build_log_read_script(*, log_file_path: str, lines: int | None = None) -> l
     quoted_log_file = shlex.quote(log_file_path)
     read_command = f"cat {quoted_log_file}" if lines is None else f"tail -n {lines} {quoted_log_file}"
     return [
-        "set -euo pipefail",
+        "set -eu",
         f'if [ ! -f {quoted_log_file} ]; then echo "{LOG_OUTPUT_ERROR_MARKER} Log file not found: {log_file_path}"; exit 3; fi',
         f'echo "{LOG_OUTPUT_START_MARKER}"',
         read_command,

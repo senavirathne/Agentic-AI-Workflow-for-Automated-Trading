@@ -523,11 +523,21 @@ def test_build_run_command_script_waits_for_log_file_before_reporting_success() 
         log_file_path="/srv/trader/logs/workflow_live_aapl_http_20260405T093243Z.log",
     )
 
+    assert lines[0] == "set -eu"
     assert lines[2] == "runner_pid=$!"
     assert lines[3] == f"for _ in $(seq 1 {function_app_module.RUN_COMMAND_LOG_FILE_WAIT_SECONDS}); do"
     assert lines[4] == "  if [ -f /srv/trader/logs/workflow_live_aapl_http_20260405T093243Z.log ]; then"
     assert function_app_module.RUN_COMMAND_LAUNCH_SUCCESS_MARKER in lines[5]
     assert function_app_module.RUN_COMMAND_LAUNCH_ERROR_MARKER in lines[10]
+
+
+def test_build_log_read_script_uses_posix_safe_shell_options() -> None:
+    lines = function_app_module._build_log_read_script(
+        log_file_path="/srv/trader/logs/workflow_live_aapl_http_20260405T093243Z.log",
+        lines=50,
+    )
+
+    assert lines[0] == "set -eu"
 
 
 def test_start_vm_rejects_live_after_backtest_for_live_mode() -> None:
