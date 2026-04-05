@@ -1,6 +1,6 @@
 # 📈 Agentic AI Workflow for Automated Trading
 
-`fresh_simple_trading_project` is a standalone Python trading workflow that combines deterministic market analysis with LLM-based review agents. 
+`project` is a standalone Python trading workflow that combines deterministic market analysis with LLM-based review agents. 
 
 It is designed to be highly modular, supporting both live trading and historical backtesting, with optional cloud integration.
 
@@ -12,7 +12,7 @@ It is designed to be highly modular, supporting both live trading and historical
 - **Flexible Storage**: Local (SQLite/Disk) or Azure-backed (Azure SQL/Blob) artifact persistence.
 - **Cloud Ready**: Includes an Azure Function App that starts a VM and dispatches the trading CLI remotely.
 
-This project lives inside the repository as its own installable package (`fresh_simple_trading_project`), providing the console entry point `fresh-trader`.
+This project lives inside the repository as its own installable package (`project`), providing the console entry point `fresh-trader`.
 
 ---
 

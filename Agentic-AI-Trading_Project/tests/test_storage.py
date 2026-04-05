@@ -8,8 +8,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import mssql
 from sqlalchemy.schema import CreateTable
 
-from fresh_simple_trading_project.config import Settings
-from fresh_simple_trading_project.models import (
+from project.config import Settings
+from project.models import (
     Action,
     AnalysisResult,
     AlphaVantageIndicatorSnapshot,
@@ -23,14 +23,14 @@ from fresh_simple_trading_project.models import (
     RiskResult,
     WorkflowResult,
 )
-from fresh_simple_trading_project.storage import (
+from project.storage import (
     AzureBlobRawStore,
     AzureSQLResultStore,
     LocalRawStore,
     SQLAlchemyResultStore,
     StorageRef,
 )
-from fresh_simple_trading_project.workflow import build_raw_store, build_result_store
+from project.workflow import build_raw_store, build_result_store
 
 
 def test_local_raw_store_returns_file_storage_refs(tmp_path: Path) -> None:

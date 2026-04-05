@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from fresh_simple_trading_project.config import LLMConfig
-from fresh_simple_trading_project.llm import DeepSeekLLMClient, FallbackLLMClient, LLMRequestError, is_quota_exhaustion_error
+from project.config import LLMConfig
+from project.llm import DeepSeekLLMClient, FallbackLLMClient, LLMRequestError, is_quota_exhaustion_error
 
 
 def test_generate_raises_on_transport_failure() -> None:

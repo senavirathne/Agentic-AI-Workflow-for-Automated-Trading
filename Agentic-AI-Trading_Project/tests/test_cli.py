@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pytest
 
-import fresh_simple_trading_project.cli as cli_module
+import project.cli as cli_module
 
 
 def test_resolve_project_root_finds_parent_project_root(tmp_path: Path) -> None:
     project_root = _make_project_layout(tmp_path)
     src_dir = project_root / "src"
-    package_dir = src_dir / "fresh_simple_trading_project"
+    package_dir = src_dir / "project"
 
     assert cli_module._resolve_project_root(project_root) == project_root
     assert cli_module._resolve_project_root(src_dir) == project_root
@@ -51,7 +51,7 @@ def test_main_uses_resolved_project_root_when_invoked_from_src(monkeypatch, tmp_
 
 
 def _make_project_layout(tmp_path: Path) -> Path:
-    project_root = tmp_path / "fresh_simple_trading_project"
-    (project_root / "src" / "fresh_simple_trading_project").mkdir(parents=True)
+    project_root = tmp_path / "project"
+    (project_root / "src" / "project").mkdir(parents=True)
     (project_root / "pyproject.toml").write_text("[project]\nname = 'fresh-simple-trading-project'\n", encoding="utf-8")
     return project_root

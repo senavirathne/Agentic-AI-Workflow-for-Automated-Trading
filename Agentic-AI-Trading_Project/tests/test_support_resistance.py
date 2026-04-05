@@ -5,13 +5,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from fresh_simple_trading_project.agents import DecisionCoordinatorAgent
-from fresh_simple_trading_project.config import Settings
-from fresh_simple_trading_project.decision_engine import DecisionEngine
-from fresh_simple_trading_project.features import FeatureEngineeringModule
-from fresh_simple_trading_project.llm import TextGenerationClient
-from fresh_simple_trading_project.market_analysis import MarketAnalysisModule
-from fresh_simple_trading_project.models import AccountState, AnalysisResult, RetrievalResult, RiskResult
+from project.agents import DecisionCoordinatorAgent
+from project.config import Settings
+from project.decision_engine import DecisionEngine
+from project.features import FeatureEngineeringModule
+from project.llm import TextGenerationClient
+from project.market_analysis import MarketAnalysisModule
+from project.models import AccountState, AnalysisResult, RetrievalResult, RiskResult
 
 
 def test_market_analysis_identifies_support_and_resistance_from_history(tmp_path: Path) -> None:

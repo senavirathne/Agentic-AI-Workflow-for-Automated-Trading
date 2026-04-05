@@ -8,39 +8,39 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import fresh_simple_trading_project.workflow as workflow_module
-from fresh_simple_trading_project.config import RunMode, Settings
-from fresh_simple_trading_project.agents import (
+import project.workflow as workflow_module
+from project.config import RunMode, Settings
+from project.agents import (
     DecisionCoordinatorAgent,
     HoldForecastAgent,
     NewsResearchAgent,
     RiskReviewAgent,
     TechnicalAnalysisAgent,
 )
-from fresh_simple_trading_project.data_collection import (
+from project.data_collection import (
     DataCollectionModule,
     HistoricalReplayDataClient,
     SimulatedAccountClient,
     StaticMarketDataClient,
 )
-from fresh_simple_trading_project.decision_engine import DecisionEngine
-from fresh_simple_trading_project.eda import EDAModule
-from fresh_simple_trading_project.execution import ExecutionModule, InMemoryBrokerClient
-from fresh_simple_trading_project.features import FeatureEngineeringModule
-from fresh_simple_trading_project.information_retrieval import (
+from project.decision_engine import DecisionEngine
+from project.eda import EDAModule
+from project.execution import ExecutionModule, InMemoryBrokerClient
+from project.features import FeatureEngineeringModule
+from project.information_retrieval import (
     AlphaVantageNewsSearchClient,
     CombinedNewsSearchClient,
     InformationRetrievalModule,
     StaticNewsSearchClient,
     WebSearchNewsClient,
 )
-from fresh_simple_trading_project.llm import FallbackLLMClient, LLMRequestError, OpenAILLMClient, TextGenerationClient
-from fresh_simple_trading_project.market_analysis import MarketAnalysisModule
-from fresh_simple_trading_project.models import AlphaVantageIndicatorSnapshot, IndicatorHourChunk, NewsArticle, RetrievalResult
-from fresh_simple_trading_project.risk_analysis import RiskAnalysisModule
-from fresh_simple_trading_project.storage import InMemoryResultStore, LocalRawStore
-from fresh_simple_trading_project.utils import last_closed_us_market_day_cutoff, us_market_day_dates
-from fresh_simple_trading_project.workflow import TradingWorkflow
+from project.llm import FallbackLLMClient, LLMRequestError, OpenAILLMClient, TextGenerationClient
+from project.market_analysis import MarketAnalysisModule
+from project.models import AlphaVantageIndicatorSnapshot, IndicatorHourChunk, NewsArticle, RetrievalResult
+from project.risk_analysis import RiskAnalysisModule
+from project.storage import InMemoryResultStore, LocalRawStore
+from project.utils import last_closed_us_market_day_cutoff, us_market_day_dates
+from project.workflow import TradingWorkflow
 
 
 def test_run_once_executes_fresh_hourly_architecture(tmp_path: Path) -> None:

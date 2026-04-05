@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fresh_simple_trading_project.config as config_module
+import project.config as config_module
 import pytest
-from fresh_simple_trading_project.config import Settings
+from project.config import Settings
 
 
 ENV_KEYS = [
@@ -78,9 +78,9 @@ def test_settings_use_temp_storage_root_inside_azure_functions(tmp_path: Path, m
     settings = Settings.from_env(project_root=tmp_path)
 
     assert settings.paths.project_root == tmp_path
-    assert settings.paths.data_dir == azure_temp_root / "fresh_simple_trading_project" / "data"
+    assert settings.paths.data_dir == azure_temp_root / "project" / "data"
     assert settings.paths.raw_dir == settings.paths.data_dir / "raw"
-    assert settings.paths.reports_dir == azure_temp_root / "fresh_simple_trading_project" / "reports"
+    assert settings.paths.reports_dir == azure_temp_root / "project" / "reports"
     assert settings.paths.data_dir.exists()
     assert settings.paths.reports_dir.exists()
 

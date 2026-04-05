@@ -5,13 +5,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from fresh_simple_trading_project.backtesting import BacktestingEngine
-from fresh_simple_trading_project.config import Settings
-from fresh_simple_trading_project.decision_engine import DecisionEngine
-from fresh_simple_trading_project.eda import EDAModule
-from fresh_simple_trading_project.features import FeatureEngineeringModule
-from fresh_simple_trading_project.market_analysis import MarketAnalysisModule
-from fresh_simple_trading_project.risk_analysis import RiskAnalysisModule
+from project.backtesting import BacktestingEngine
+from project.config import Settings
+from project.decision_engine import DecisionEngine
+from project.eda import EDAModule
+from project.features import FeatureEngineeringModule
+from project.market_analysis import MarketAnalysisModule
+from project.risk_analysis import RiskAnalysisModule
 
 
 def test_backtesting_engine_generates_summary_and_trades(tmp_path: Path) -> None:

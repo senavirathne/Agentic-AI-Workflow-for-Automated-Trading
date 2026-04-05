@@ -6,21 +6,21 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from fresh_simple_trading_project.config import RunMode, Settings
-from fresh_simple_trading_project.data_collection import (
+from project.config import RunMode, Settings
+from project.data_collection import (
     DataCollectionModule,
     HistoricalReplayDataClient,
     SimulatedAccountClient,
 )
-from fresh_simple_trading_project.decision_engine import DecisionEngine
-from fresh_simple_trading_project.eda import EDAModule
-from fresh_simple_trading_project.execution import ExecutionModule, InMemoryBrokerClient
-from fresh_simple_trading_project.features import FeatureEngineeringModule
-from fresh_simple_trading_project.market_analysis import MarketAnalysisModule
-from fresh_simple_trading_project.models import RetrievalResult
-from fresh_simple_trading_project.risk_analysis import RiskAnalysisModule
-from fresh_simple_trading_project.storage import InMemoryResultStore
-from fresh_simple_trading_project.workflow import TradingWorkflow
+from project.decision_engine import DecisionEngine
+from project.eda import EDAModule
+from project.execution import ExecutionModule, InMemoryBrokerClient
+from project.features import FeatureEngineeringModule
+from project.market_analysis import MarketAnalysisModule
+from project.models import RetrievalResult
+from project.risk_analysis import RiskAnalysisModule
+from project.storage import InMemoryResultStore
+from project.workflow import TradingWorkflow
 
 
 class DummyRawStore:

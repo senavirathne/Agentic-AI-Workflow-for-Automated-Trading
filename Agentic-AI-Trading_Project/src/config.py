@@ -200,7 +200,7 @@ class LLMConfig:
                 env_var = "DEEPSEEK_API_KEY"
             raise RuntimeError(
                 f"Missing {self.provider_label} API credentials. "
-                f"Set {env_var} in fresh_simple_trading_project/.env."
+                f"Set {env_var} in project/.env."
             )
 
 
@@ -242,7 +242,7 @@ class Settings:
             return
         raise RuntimeError(
             "Missing LLM API credentials. "
-            "Set DEEPSEEK_API_KEY or OPENAI_API_KEY in fresh_simple_trading_project/.env."
+            "Set DEEPSEEK_API_KEY or OPENAI_API_KEY in project/.env."
         )
 
     @classmethod
@@ -473,7 +473,7 @@ def _resolve_storage_root(project_root: Path, env: dict[str, str]) -> Path:
     if override:
         return Path(override).expanduser().resolve()
     if _is_azure_functions_environment(env):
-        return Path(tempfile.gettempdir()).resolve() / "fresh_simple_trading_project"
+        return Path(tempfile.gettempdir()).resolve() / "project"
     return project_root
 
 

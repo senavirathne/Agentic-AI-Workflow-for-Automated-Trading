@@ -3,16 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-import fresh_simple_trading_project.information_retrieval as information_retrieval_module
-from fresh_simple_trading_project.agents import NewsResearchAgent
-from fresh_simple_trading_project.information_retrieval import (
+import project.information_retrieval as information_retrieval_module
+from project.agents import NewsResearchAgent
+from project.information_retrieval import (
     AlphaVantageNewsSearchClient,
     CombinedNewsSearchClient,
     InformationRetrievalModule,
     WebSearchNewsClient,
 )
-from fresh_simple_trading_project.models import NewsArticle
-from fresh_simple_trading_project.storage import InMemoryResultStore
+from project.models import NewsArticle
+from project.storage import InMemoryResultStore
 
 
 @dataclass

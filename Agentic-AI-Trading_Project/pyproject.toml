@@ -24,7 +24,7 @@ dev = ["pytest"]
 azure = ["azure-identity", "azure-mgmt-compute", "azure-storage-blob"]
 
 [project.scripts]
-fresh-trader = "fresh_simple_trading_project.cli:main"
+fresh-trader = "project.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

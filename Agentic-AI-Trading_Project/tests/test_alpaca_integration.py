@@ -7,17 +7,17 @@ from types import SimpleNamespace
 import pandas as pd
 from alpaca.data.timeframe import TimeFrameUnit
 
-import fresh_simple_trading_project.workflow as workflow_module
-from fresh_simple_trading_project.alpaca_integration import (
+import project.workflow as workflow_module
+from project.alpaca_integration import (
     AlpacaAccountClient,
     AlpacaBrokerClient,
     AlpacaMarketDataClient,
     AlpacaService,
 )
-from fresh_simple_trading_project.data_collection import HistoricalReplayDataClient
-from fresh_simple_trading_project.config import AlpacaConfig
-from fresh_simple_trading_project.execution import ExecutionModule
-from fresh_simple_trading_project.storage import InMemoryResultStore
+from project.data_collection import HistoricalReplayDataClient
+from project.config import AlpacaConfig
+from project.execution import ExecutionModule
+from project.storage import InMemoryResultStore
 
 
 def test_alpaca_service_fetches_and_normalizes_five_minute_bars() -> None:

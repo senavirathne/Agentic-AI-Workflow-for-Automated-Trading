@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fresh_simple_trading_project import utils
+from project import utils
 
 
 def test_sleep_until_uses_explicit_sleep_seconds(monkeypatch) -> None:

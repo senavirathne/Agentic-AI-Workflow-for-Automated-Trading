@@ -172,15 +172,15 @@ def vm_function_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "sub-id")
     monkeypatch.setenv("AZURE_VM_RESOURCE_GROUP", "rg-test")
     monkeypatch.setenv("AZURE_VM_NAME", "vm-test")
-    monkeypatch.setenv("VM_PROJECT_DIR", "/opt/fresh_simple_trading_project")
-    monkeypatch.setenv("VM_VENV_ACTIVATE", "/opt/fresh_simple_trading_project/.venv/bin/activate")
+    monkeypatch.setenv("VM_PROJECT_DIR", "/opt/project")
+    monkeypatch.setenv("VM_VENV_ACTIVATE", "/opt/project/.venv/bin/activate")
     monkeypatch.setenv("VM_DEFAULT_SYMBOL", "MSFT")
     monkeypatch.setenv("VM_DEFAULT_LOOPS", "2")
     monkeypatch.setenv("VM_DEFAULT_MODE", "live")
     monkeypatch.setenv("VM_TIMER_ENABLED", "false")
     monkeypatch.setenv("VM_AUTO_SHUTDOWN", "true")
     monkeypatch.setenv("VM_AUTO_SHUTDOWN_DELAY_SECONDS", "900")
-    monkeypatch.setenv("VM_LOG_DIR", "/opt/fresh_simple_trading_project/logs")
+    monkeypatch.setenv("VM_LOG_DIR", "/opt/project/logs")
     monkeypatch.setattr(
         function_app_module,
         "_build_run_command_input",
@@ -193,7 +193,7 @@ def test_dispatch_state_path_uses_temp_storage_without_project_package(monkeypat
 
     state_path = function_app_module._dispatch_state_path()
 
-    assert state_path == Path(tempfile.gettempdir()).resolve() / "fresh_simple_trading_project" / "data" / "vm_dispatch_state.json"
+    assert state_path == Path(tempfile.gettempdir()).resolve() / "project" / "data" / "vm_dispatch_state.json"
 
 
 def test_start_vm_uses_defaults_when_payload_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,9 +219,9 @@ def test_start_vm_uses_defaults_when_payload_missing(monkeypatch: pytest.MonkeyP
     assert payload["dispatch"]["mode"] == "live"
     assert payload["dispatch"]["live_after_backtest"] is False
     assert payload["dispatch"]["start_requested"] is True
-    assert payload["dispatch"]["log_file_path"] == "/opt/fresh_simple_trading_project/logs/workflow_live_msft_http_20260405T093243Z.log"
+    assert payload["dispatch"]["log_file_path"] == "/opt/project/logs/workflow_live_msft_http_20260405T093243Z.log"
     assert payload["dispatch"]["log_tail_command"] == (
-        "tail -f /opt/fresh_simple_trading_project/logs/workflow_live_msft_http_20260405T093243Z.log"
+        "tail -f /opt/project/logs/workflow_live_msft_http_20260405T093243Z.log"
     )
     assert fake_compute.virtual_machines.start_calls == [("rg-test", "vm-test")]
     assert len(fake_compute.virtual_machines.run_command_calls) == 1
@@ -274,14 +274,14 @@ def test_start_vm_accepts_get_query_params_and_returns_log_urls(monkeypatch: pyt
     assert payload["dispatch"]["log_url"] == (
         "http://localhost/api/trading/session/log"
         "?code=test-key"
-        "&log_file_path=%2Fopt%2Ffresh_simple_trading_project%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
+        "&log_file_path=%2Fopt%2Fproject%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
         "&start_if_needed=true"
         "&wait_for_running_seconds=90"
     )
     assert payload["dispatch"]["log_download_url"] == (
         "http://localhost/api/trading/session/log"
         "?code=test-key"
-        "&log_file_path=%2Fopt%2Ffresh_simple_trading_project%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
+        "&log_file_path=%2Fopt%2Fproject%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
         "&start_if_needed=true"
         "&wait_for_running_seconds=90"
         "&download=true"
@@ -361,7 +361,7 @@ def test_launch_vm_run_starts_stopped_vm_and_runs_command(monkeypatch: pytest.Mo
 
     assert dispatch["accepted"] is True
     assert dispatch["start_requested"] is True
-    assert dispatch["log_file_path"] == "/opt/fresh_simple_trading_project/logs/workflow_live_aapl_http_20260405T093243Z.log"
+    assert dispatch["log_file_path"] == "/opt/project/logs/workflow_live_aapl_http_20260405T093243Z.log"
     assert fake_compute.virtual_machines.start_calls == [("rg-test", "vm-test")]
     assert len(fake_compute.virtual_machines.run_command_calls) == 1
 
@@ -557,7 +557,7 @@ def test_build_workflow_runner_script_uploads_blob_and_delays_shutdown() -> None
         blob_log_blob_name="logs/2026/04/05/workflow_live_aapl_http_20260405T093243Z.log",
     )
 
-    assert any("python -m fresh_simple_trading_project.log_blob_uploader" in line for line in lines)
+    assert any("python -m project.log_blob_uploader" in line for line in lines)
     assert any("--container workflow-logs" in line for line in lines)
     assert any(
         "--blob-name logs/2026/04/05/workflow_live_aapl_http_20260405T093243Z.log" in line for line in lines
@@ -678,7 +678,7 @@ def test_build_run_command_script_appends_live_run_after_backtest() -> None:
     )
 
     assert "--mode backtest --symbol AAPL --max-iterations 4" in lines[1]
-    assert "python -m fresh_simple_trading_project.cli run --mode live --symbol AAPL" in lines[1]
+    assert "python -m project.cli run --mode live --symbol AAPL" in lines[1]
     assert "sudo shutdown -h now" in lines[1]
 
 
@@ -709,7 +709,7 @@ def test_build_run_command_script_orders_backtest_then_live_then_shutdown() -> N
 
     wrapper_line = lines[1]
     backtest_index = wrapper_line.index("--mode backtest --symbol AAPL --max-iterations 4")
-    live_index = wrapper_line.index("python -m fresh_simple_trading_project.cli run --mode live --symbol AAPL")
+    live_index = wrapper_line.index("python -m project.cli run --mode live --symbol AAPL")
     shutdown_index = wrapper_line.index("sudo shutdown -h now")
 
     assert backtest_index < live_index < shutdown_index
@@ -802,8 +802,8 @@ def test_trading_vm_log_returns_latest_log_tail(monkeypatch: pytest.MonkeyPatch)
             "resource_group": "rg-test",
             "start_requested": False,
             "power_state": "running",
-            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
-            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_file_path": "/opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
         }
     )
 
@@ -820,7 +820,7 @@ def test_trading_vm_log_returns_latest_log_tail(monkeypatch: pytest.MonkeyPatch)
     payload = json.loads(response.get_body().decode("utf-8"))
 
     assert response.status_code == 200
-    assert payload["log_file_path"] == "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log"
+    assert payload["log_file_path"] == "/opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log"
     assert payload["lines"] == 20
     assert payload["content"] == "decision line\nrisk line"
     assert len(fake_compute.virtual_machines.run_command_calls) == 1
@@ -843,8 +843,8 @@ def test_trading_vm_log_returns_409_when_vm_is_stopped(monkeypatch: pytest.Monke
             "resource_group": "rg-test",
             "start_requested": False,
             "power_state": "deallocated",
-            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
-            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_file_path": "/opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
         }
     )
 
@@ -894,8 +894,8 @@ def test_trading_vm_log_can_start_vm_before_reading(monkeypatch: pytest.MonkeyPa
             "resource_group": "rg-test",
             "start_requested": False,
             "power_state": "deallocated",
-            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
-            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_file_path": "/opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
         }
     )
 
@@ -948,8 +948,8 @@ def test_trading_vm_log_waits_for_vm_to_finish_starting(monkeypatch: pytest.Monk
             "resource_group": "rg-test",
             "start_requested": False,
             "power_state": "starting",
-            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
-            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_file_path": "/opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
         }
     )
 
@@ -1000,8 +1000,8 @@ def test_trading_vm_log_can_download_full_log(monkeypatch: pytest.MonkeyPatch) -
             "resource_group": "rg-test",
             "start_requested": False,
             "power_state": "running",
-            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
-            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_file_path": "/opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
         }
     )
 

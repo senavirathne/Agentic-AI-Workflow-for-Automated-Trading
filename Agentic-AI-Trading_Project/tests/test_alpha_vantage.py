@@ -4,13 +4,13 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from fresh_simple_trading_project.alpha_vantage import (
+from project.alpha_vantage import (
     AlphaVantageIndicatorService,
     LayeredCache,
     default_indicator_specs,
 )
-from fresh_simple_trading_project.config import AlphaVantageConfig
-from fresh_simple_trading_project.storage import InMemoryResultStore
+from project.config import AlphaVantageConfig
+from project.storage import InMemoryResultStore
 
 
 def test_default_indicator_specs_deduplicate_requested_indicator_names() -> None:
@@ -193,7 +193,7 @@ def test_alpha_vantage_reuses_result_store_snapshot_without_api_key() -> None:
 
 
 def test_alpha_vantage_build_snapshot_reuses_current_day_store_without_refetch(monkeypatch) -> None:
-    monkeypatch.setattr("fresh_simple_trading_project.alpha_vantage._requested_trading_day", lambda _: "2025-01-03")
+    monkeypatch.setattr("project.alpha_vantage._requested_trading_day", lambda _: "2025-01-03")
     counter = _CallCounter()
     store = InMemoryResultStore()
     first_service = AlphaVantageIndicatorService(
@@ -244,7 +244,7 @@ def test_alpha_vantage_build_snapshot_refreshes_when_store_only_has_stale_day(mo
     )
     first_service.build_snapshot("AAPL", end_time="2025-01-03T10:00:00Z")
 
-    monkeypatch.setattr("fresh_simple_trading_project.alpha_vantage._requested_trading_day", lambda _: "2025-01-04")
+    monkeypatch.setattr("project.alpha_vantage._requested_trading_day", lambda _: "2025-01-04")
     counter.calls = 0
     second_service = AlphaVantageIndicatorService(
         AlphaVantageConfig(

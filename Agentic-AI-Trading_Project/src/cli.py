@@ -67,11 +67,11 @@ def _resolve_project_root(start: Path | None = None) -> Path:
     """Resolve the standalone project root even when invoked from `src/`."""
     current = Path(start or Path.cwd()).resolve()
     for candidate in [current, *current.parents]:
-        if (candidate / "pyproject.toml").is_file() and (candidate / "src" / "fresh_simple_trading_project").is_dir():
+        if (candidate / "pyproject.toml").is_file() and (candidate / "src" / "project").is_dir():
             return candidate
 
     fallback = Path(__file__).resolve().parents[2]
-    if (fallback / "src" / "fresh_simple_trading_project").is_dir():
+    if (fallback / "src" / "project").is_dir():
         return fallback
     return current
 

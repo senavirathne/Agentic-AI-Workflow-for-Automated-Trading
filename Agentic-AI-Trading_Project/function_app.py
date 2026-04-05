@@ -98,7 +98,7 @@ def _dispatch_storage_root() -> Path:
     if override and override.strip():
         return Path(override).expanduser().resolve()
     if _is_azure_functions_environment():
-        return Path(tempfile.gettempdir()).resolve() / "fresh_simple_trading_project"
+        return Path(tempfile.gettempdir()).resolve() / "project"
     return project_root
 
 
@@ -564,7 +564,7 @@ def _build_workflow_runner_script(
     quoted_log_blob_name = shlex.quote(blob_log_blob_name) if blob_log_blob_name else None
     quoted_log_blob_container = shlex.quote(config.log_blob_container) if config.log_blob_container else None
     primary_run_command = (
-        "python -m fresh_simple_trading_project.cli run "
+        "python -m project.cli run "
         f"--mode {quoted_mode} --symbol {quoted_symbol}"
     )
     if mode == BACKTEST_MODE:
@@ -588,7 +588,7 @@ def _build_workflow_runner_script(
     if live_after_backtest and mode == BACKTEST_MODE:
         lines.append('echo "[Dispatcher] Backtest finished. Starting live follow-up run."')
         lines.append(
-            "python -m fresh_simple_trading_project.cli run "
+            "python -m project.cli run "
             f"--mode {LIVE_MODE} --symbol {quoted_symbol}"
         )
     if quoted_log_blob_name and quoted_log_blob_container:
@@ -596,7 +596,7 @@ def _build_workflow_runner_script(
             [
                 'echo "[Dispatcher] Uploading workflow log to Azure Blob Storage."',
                 (
-                    "if python -m fresh_simple_trading_project.log_blob_uploader "
+                    "if python -m project.log_blob_uploader "
                     f"--file {quoted_log_file} "
                     f"--container {quoted_log_blob_container} "
                     f"--blob-name {quoted_log_blob_name}; then"

@@ -2,7 +2,7 @@ __pycache__/
 .pytest_cache/
 data/
 reports/
-src/fresh_simple_trading_project.egg-info/
+src/project.egg-info/
 .env
 
 .python_packages

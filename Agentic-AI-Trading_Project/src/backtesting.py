@@ -112,7 +112,7 @@ class BacktestingEngine:
             raise RuntimeError("Legacy BacktestingEngine usage requires config and workflow modules.")
 
         target_symbol = (symbol or config.symbol).upper()
-        isolated_root = Path("/tmp/fresh_simple_trading_project_backtesting")
+        isolated_root = Path("/tmp/project_backtesting")
         isolated_root.mkdir(parents=True, exist_ok=True)
         paths = Paths(
             project_root=isolated_root,
