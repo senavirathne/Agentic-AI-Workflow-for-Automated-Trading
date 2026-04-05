@@ -45,6 +45,8 @@ class LayeredCache:
     disk_putter: Callable[[Hashable, pd.DataFrame], None] | None = None
 
     def get(self, key: Hashable) -> pd.DataFrame | None:
+        """Load a dataframe from memory, then store, then disk."""
+
         memory_value = self.memory_cache.get(key)
         if memory_value is not None:
             return memory_value.copy()
@@ -73,6 +75,8 @@ class LayeredCache:
         persist_store: bool = True,
         persist_disk: bool = True,
     ) -> pd.DataFrame:
+        """Store a dataframe in memory and optionally persist it downstream."""
+
         normalized = value.sort_index().copy()
         self.memory_cache[key] = normalized.copy()
         if persist_store and self.store_putter is not None and not normalized.empty:
@@ -216,18 +220,12 @@ class AlphaVantageIndicatorService:
     result_store: ResultStore | None = None
     _aligned_frame_cache: dict[tuple[str, str], pd.DataFrame] = field(default_factory=dict, init=False, repr=False)
     _daily_frame_cache: dict[tuple[str, str, str], pd.DataFrame] = field(default_factory=dict, init=False, repr=False)
-    _day_frame_cache: LayeredCache = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        """Create the cache directory when disk caching is enabled."""
+
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._day_frame_cache = LayeredCache(
-            memory_cache=self._daily_frame_cache,
-            store_getter=self._load_day_frame_from_store,
-            disk_getter=self._load_day_frame_from_disk,
-            store_putter=self._persist_day_frame_to_store,
-            disk_putter=self._persist_day_frame_to_disk,
-        )
 
     def build_snapshot(
         self,
@@ -235,6 +233,16 @@ class AlphaVantageIndicatorService:
         *,
         end_time: pd.Timestamp | str | None = None,
     ) -> AlphaVantageIndicatorSnapshot:
+        """Build a snapshot for the requested symbol and optional checkpoint.
+
+        Args:
+            symbol: Ticker symbol to load.
+            end_time: Optional timestamp used to slice the latest available day.
+
+        Returns:
+            A normalized Alpha Vantage indicator snapshot.
+        """
+
         interval = self.config.interval or DEFAULT_INTERVAL
         normalized_symbol = symbol.upper()
         if end_time is None:
@@ -280,7 +288,16 @@ class AlphaVantageIndicatorService:
         trading_day: str | None = None,
         end_time: pd.Timestamp | str | None = None,
     ) -> AlphaVantageIndicatorSnapshot | None:
-        """Load a locally available snapshot without triggering a network refresh."""
+        """Load a locally available snapshot without triggering a network refresh.
+
+        Args:
+            symbol: Ticker symbol to load.
+            trading_day: Optional specific trading day to load.
+            end_time: Optional checkpoint to slice an already cached trading day.
+
+        Returns:
+            A snapshot from local cache/store when available, otherwise ``None``.
+        """
 
         if trading_day is not None and end_time is not None:
             raise ValueError("Provide either trading_day or end_time when loading a local Alpha Vantage snapshot.")
@@ -320,6 +337,17 @@ class AlphaVantageIndicatorService:
         interval: str | None = None,
         refresh: bool = False,
     ) -> pd.DataFrame:
+        """Build the merged aligned indicator frame for one symbol.
+
+        Args:
+            symbol: Ticker symbol to load.
+            interval: Optional interval override.
+            refresh: Whether to force a fresh fetch before merging local history.
+
+        Returns:
+            The aligned indicator frame sorted by timestamp.
+        """
+
         normalized_symbol = symbol.upper()
         resolved_interval = interval or self.config.interval or DEFAULT_INTERVAL
         cache_key = (normalized_symbol, resolved_interval)
@@ -345,6 +373,17 @@ class AlphaVantageIndicatorService:
         *,
         end_time: pd.Timestamp | str | None = None,
     ) -> pd.DataFrame:
+        """Join Alpha Vantage indicators onto 5-minute price bars.
+
+        Args:
+            symbol: Ticker symbol being analyzed.
+            price_bars: Source 5-minute OHLCV bars.
+            end_time: Optional checkpoint to slice both bars and indicators.
+
+        Returns:
+            A feature frame ready for technical analysis.
+        """
+
         frame = price_bars.copy().sort_index()
         if end_time is not None:
             normalized_end = _normalize_timestamp(end_time)
@@ -406,7 +445,17 @@ class AlphaVantageIndicatorService:
         end_time: pd.Timestamp | str,
         required_trading_days: list[str] | None = None,
     ) -> bool:
-        """Ensure the requested trading-day windows exist in cache/DB, fetching once if needed."""
+        """Ensure the requested trading-day windows exist in cache or storage.
+
+        Args:
+            symbol: Ticker symbol to prepare.
+            start_time: Start of the required window.
+            end_time: End of the required window.
+            required_trading_days: Optional explicit trading-day list for the window.
+
+        Returns:
+            ``True`` when a fetch/persist cycle was needed, otherwise ``False``.
+        """
         normalized_symbol = symbol.upper()
         interval = self.config.interval or DEFAULT_INTERVAL
         window_start = _normalize_timestamp(start_time)
@@ -459,6 +508,113 @@ class AlphaVantageIndicatorService:
         )
         return True
 
+    def ensure_backtest_coverage(
+        self,
+        symbol: str,
+        *,
+        source_bars: pd.DataFrame,
+        required_trading_days: list[str],
+        result_store: ResultStore | None = None,
+        database_path: Path | None = None,
+        cache_path: Path | None = None,
+    ) -> None:
+        """Ensure the local backtest store has day snapshots for the replay window.
+
+        Args:
+            symbol: Ticker symbol being prepared for replay.
+            source_bars: Full source 5-minute bar history used by the backtest.
+            required_trading_days: Trading days that must be available locally.
+            result_store: Optional override for the store that should hold the
+                preloaded snapshots.
+            database_path: Optional database path used only for status messages.
+            cache_path: Optional cache path used only for status messages.
+
+        Raises:
+            RuntimeError: If required local coverage is still unavailable after
+                syncing from cache and attempting one fetch cycle.
+            ValueError: If the supplied bar history is empty.
+        """
+
+        normalized_symbol = symbol.upper()
+        if source_bars.empty:
+            raise ValueError(f"No 5-minute bars available for {normalized_symbol}")
+
+        store = result_store or self.result_store
+        if store is None:
+            raise RuntimeError("Alpha Vantage backtest coverage requires a configured result store.")
+
+        interval = self.config.interval or DEFAULT_INTERVAL
+        start_time = pd.Timestamp(source_bars.index.min())
+        end_time = pd.Timestamp(source_bars.index.max())
+        trading_day_count = len(required_trading_days)
+        database_display = (
+            str(Path(database_path).resolve()) if database_path is not None else "<not configured>"
+        )
+        resolved_cache_path = cache_path or self.cache_dir
+        cache_display = (
+            str(Path(resolved_cache_path).resolve()) if resolved_cache_path is not None else "<not configured>"
+        )
+        print(
+            f"[Workflow] Alpha Vantage backtest preflight: ensuring local storage coverage for {normalized_symbol} "
+            f"across {trading_day_count} trading day(s) | db={database_display} | cache={cache_display}"
+        )
+        self._sync_backtest_snapshots_from_local_cache(
+            store,
+            normalized_symbol,
+            required_trading_days=required_trading_days,
+            interval=interval,
+        )
+        missing_days = self._missing_backtest_snapshot_days(
+            store,
+            normalized_symbol,
+            required_trading_days=required_trading_days,
+            interval=interval,
+        )
+        if missing_days:
+            self.ensure_data_for_window(
+                normalized_symbol,
+                start_time=start_time,
+                end_time=end_time,
+                required_trading_days=required_trading_days,
+            )
+            self._sync_backtest_snapshots_from_local_cache(
+                store,
+                normalized_symbol,
+                required_trading_days=required_trading_days,
+                interval=interval,
+            )
+            missing_days = self._missing_backtest_snapshot_days(
+                store,
+                normalized_symbol,
+                required_trading_days=required_trading_days,
+                interval=interval,
+            )
+        if missing_days:
+            partial_coverage = self._resolve_backtest_partial_coverage(
+                store,
+                normalized_symbol,
+                required_trading_days=required_trading_days,
+                interval=interval,
+            )
+            if partial_coverage is None:
+                raise RuntimeError(
+                    "Alpha Vantage backtest data is still missing from the local store after preload. "
+                    f"Missing {normalized_symbol} {interval} trading day snapshots: {missing_days}. "
+                    f"DB path: {database_display}"
+                )
+            latest_snapshot, trailing_missing_days = partial_coverage
+            latest_timestamp = _normalize_timestamp(latest_snapshot.latest_timestamp)
+            print(
+                "[Workflow] Alpha Vantage backtest preload accepted partial local coverage: "
+                f"using the latest available snapshot through {latest_timestamp.isoformat()} "
+                f"and skipping trailing unavailable trading day(s): {trailing_missing_days}."
+            )
+            return
+        print(
+            "[Workflow] Alpha Vantage backtest preload finished: required indicator snapshots and 1-hour chunks "
+            f"are available in the local store at {database_display}."
+        )
+
     def _indicator_frame_for_window(
         self,
         symbol: str,
@@ -500,6 +656,86 @@ class AlphaVantageIndicatorService:
         combined = pd.concat(daily_frames, axis=0).sort_index()
         return combined.loc[(combined.index >= window_start) & (combined.index <= window_end)].copy()
 
+    def _missing_backtest_snapshot_days(
+        self,
+        result_store: ResultStore,
+        symbol: str,
+        *,
+        required_trading_days: list[str],
+        interval: str,
+    ) -> list[str]:
+        return [
+            trading_day
+            for trading_day in required_trading_days
+            if result_store.load_alpha_vantage_indicator_snapshot(
+                symbol,
+                trading_day=trading_day,
+                interval=interval,
+            )
+            is None
+        ]
+
+    def _sync_backtest_snapshots_from_local_cache(
+        self,
+        result_store: ResultStore,
+        symbol: str,
+        *,
+        required_trading_days: list[str],
+        interval: str,
+    ) -> list[str]:
+        hydrated_days: list[str] = []
+        for trading_day in required_trading_days:
+            existing = result_store.load_alpha_vantage_indicator_snapshot(
+                symbol,
+                trading_day=trading_day,
+                interval=interval,
+            )
+            if existing is not None:
+                continue
+            snapshot = self.load_local_snapshot(symbol, trading_day=trading_day)
+            if snapshot is None:
+                continue
+            result_store.save_alpha_vantage_indicator_snapshot(snapshot)
+            hydrated_days.append(trading_day)
+
+        if hydrated_days:
+            print(
+                "[Workflow] Alpha Vantage backtest cache sync: hydrated "
+                f"{len(hydrated_days)} trading day snapshot(s) from local cache/storage into the result store. "
+                f"Trading days: {hydrated_days}"
+            )
+        return hydrated_days
+
+    def _resolve_backtest_partial_coverage(
+        self,
+        result_store: ResultStore,
+        symbol: str,
+        *,
+        required_trading_days: list[str],
+        interval: str,
+    ) -> tuple[AlphaVantageIndicatorSnapshot, list[str]] | None:
+        first_missing_index: int | None = None
+        latest_covered_snapshot: AlphaVantageIndicatorSnapshot | None = None
+
+        for index, trading_day in enumerate(required_trading_days):
+            snapshot = result_store.load_alpha_vantage_indicator_snapshot(
+                symbol,
+                trading_day=trading_day,
+                interval=interval,
+            )
+            if snapshot is None:
+                if first_missing_index is None:
+                    first_missing_index = index
+                continue
+            if first_missing_index is not None:
+                return None
+            latest_covered_snapshot = snapshot
+
+        if first_missing_index is None or first_missing_index == 0 or latest_covered_snapshot is None:
+            return None
+
+        return latest_covered_snapshot, required_trading_days[first_missing_index:]
+
     def _missing_trading_days(
         self,
         symbol: str,
@@ -533,12 +769,7 @@ class AlphaVantageIndicatorService:
             if frame.empty:
                 continue
             trading_day = daily_file.stem
-            self._day_frame_cache.put(
-                (symbol, interval, trading_day),
-                frame,
-                persist_store=False,
-                persist_disk=False,
-            )
+            self._cache_day_frame((symbol, interval, trading_day), frame)
             frames.append(frame)
         if not frames:
             return None
@@ -555,12 +786,7 @@ class AlphaVantageIndicatorService:
             frame = _snapshot_to_frame(snapshot)
             if frame.empty:
                 continue
-            self._day_frame_cache.put(
-                (symbol, interval, snapshot.trading_day),
-                frame,
-                persist_store=False,
-                persist_disk=False,
-            )
+            self._cache_day_frame((symbol, interval, snapshot.trading_day), frame)
             frames.append(frame)
         if not frames:
             return None
@@ -591,9 +817,19 @@ class AlphaVantageIndicatorService:
         allow_aligned_cache: bool,
     ) -> pd.DataFrame | None:
         cache_key = (symbol, interval, trading_day)
-        cached = self._day_frame_cache.get(cache_key)
-        if cached is not None:
+        memory_value = self._daily_frame_cache.get(cache_key)
+        if memory_value is not None:
+            return memory_value.copy()
+
+        store_value = self._load_day_frame_from_store(cache_key)
+        if store_value is not None:
+            cached = self._cache_day_frame(cache_key, store_value)
+            self._persist_day_frame_to_disk(cache_key, cached)
             return cached
+
+        disk_value = self._load_day_frame_from_disk(cache_key)
+        if disk_value is not None:
+            return self._cache_day_frame(cache_key, disk_value)
 
         if allow_aligned_cache:
             aligned = self._aligned_frame_cache.get((symbol, interval))
@@ -601,7 +837,7 @@ class AlphaVantageIndicatorService:
                 frame = _frame_for_trading_day(aligned, trading_day)
                 if not frame.empty:
                     self._store_day_frame(symbol, interval, trading_day, frame)
-                    return frame
+                    return self._daily_frame_cache[(symbol, interval, trading_day)].copy()
         return None
 
     def _persist_daily_frames(self, symbol: str, interval: str, frame: pd.DataFrame) -> None:
@@ -619,12 +855,11 @@ class AlphaVantageIndicatorService:
         *,
         persist_store: bool = True,
     ) -> None:
-        self._day_frame_cache.put(
-            (symbol, interval, trading_day),
-            frame,
-            persist_store=persist_store,
-            persist_disk=True,
-        )
+        cache_key = (symbol, interval, trading_day)
+        normalized = self._cache_day_frame(cache_key, frame)
+        if persist_store and not normalized.empty:
+            self._persist_day_frame_to_store(cache_key, normalized)
+        self._persist_day_frame_to_disk(cache_key, normalized)
 
     def _daily_cache_path(self, symbol: str, interval: str, trading_day: str) -> Path:
         return self._interval_cache_dir(symbol, interval) / f"{trading_day}.csv"
@@ -638,6 +873,13 @@ class AlphaVantageIndicatorService:
         frame = pd.read_csv(path, index_col="timestamp", parse_dates=["timestamp"])
         frame.index = pd.to_datetime(frame.index, utc=True)
         return frame.sort_index()
+
+    def _cache_day_frame(self, key: tuple[str, str, str], frame: pd.DataFrame) -> pd.DataFrame:
+        """Store one trading-day frame in memory and return a defensive copy."""
+
+        normalized = frame.sort_index().copy()
+        self._daily_frame_cache[key] = normalized.copy()
+        return normalized.copy()
 
     def _load_day_frame_from_store(self, key: Hashable) -> pd.DataFrame | None:
         if self.result_store is None:
@@ -782,6 +1024,8 @@ class AlphaVantageIndicatorService:
 
 
 def indicator_to_dataframe(name: str, data: dict[str, Any]) -> pd.DataFrame:
+    """Convert one Alpha Vantage payload into a normalized dataframe."""
+
     series = extract_technical_series(data)
     frame = pd.DataFrame.from_dict(series, orient="index")
     frame.index = pd.to_datetime(frame.index, utc=True)
@@ -795,6 +1039,8 @@ def indicator_to_dataframe(name: str, data: dict[str, Any]) -> pd.DataFrame:
 
 
 def extract_technical_series(data: dict[str, Any]) -> dict[str, Any]:
+    """Extract the technical-analysis mapping from a raw API payload."""
+
     technical_key = next((key for key in data if "Technical Analysis" in key), None)
     if technical_key is None:
         raise ValueError(f"Could not find technical analysis data in Alpha Vantage response: {data}")
@@ -802,6 +1048,8 @@ def extract_technical_series(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_indicator_column(indicator_name: str, column_name: str, column_count: int) -> str:
+    """Normalize raw Alpha Vantage column names into stable internal names."""
+
     canonical_indicator = indicator_name.upper()
     canonical_column = _canonical_name(column_name)
     column_aliases = {

@@ -207,18 +207,19 @@ az functionapp deployment source config-zip \
 
 ### Trigger the VM run
 
-The Function App exposes two routes with `AuthLevel.FUNCTION`:
+The Function App exposes these `AuthLevel.FUNCTION` routes:
 
-- `POST /api/trading/vm/start`
+- `GET|POST /api/trading/vm/start`
 - `GET /api/trading/vm/status`
 - `GET /api/trading/vm/log`
+- Compatibility aliases: `/api/trading/session/start`, `/api/trading/session/status`, `/api/trading/session/log`
 
 Behavior mapping for the VM trigger:
 
-- Backtest only: call `POST /api/trading/vm/start` with `{"mode":"backtest","loops":<n>}`. The VM runs the backtest loop for exactly `<n>` iterations, then stops at the end when `VM_AUTO_SHUTDOWN=true`.
-- Live only: call `POST /api/trading/vm/start` with `{"mode":"live"}`. The VM runs the live workflow, waits roughly one hour between hourly checkpoints, and exits when the live market is closed. When `VM_AUTO_SHUTDOWN=true`, the VM then powers off.
-- Backtest then live: call `POST /api/trading/vm/start` with `{"mode":"backtest","loops":<n>,"live_after_backtest":true}`. The VM completes the backtest iterations first, then starts the live workflow, and keeps going until the market closes. When `VM_AUTO_SHUTDOWN=true`, shutdown happens only after the live run finishes.
-- Each accepted dispatch response now includes `log_file_path` and `log_tail_command` so you can inspect the workflow output on the VM while it runs.
+- Backtest only: call `GET|POST /api/trading/vm/start` with `mode=backtest` and `loops=<n>`. The VM runs the backtest loop for exactly `<n>` iterations, then stops at the end when `VM_AUTO_SHUTDOWN=true`.
+- Live only: call `GET|POST /api/trading/vm/start` with `mode=live`. The VM runs the live workflow, waits roughly one hour between hourly checkpoints, and exits when the live market is closed. When `VM_AUTO_SHUTDOWN=true`, the VM then powers off.
+- Backtest then live: call `GET|POST /api/trading/vm/start` with `mode=backtest`, `loops=<n>`, and `live_after_backtest=true`. The VM completes the backtest iterations first, then starts the live workflow, and keeps going until the market closes. When `VM_AUTO_SHUTDOWN=true`, shutdown happens only after the live run finishes.
+- Each accepted dispatch response includes `log_file_path`, `log_tail_command`, `log_url`, and `log_download_url`.
 
 Example start request:
 
@@ -235,11 +236,26 @@ curl -X POST \
   }'
 ```
 
+Equivalent GET request:
+
+```bash
+curl \
+  "https://<YOUR_FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/start?code=<FUNCTION_KEY>&symbol=AAPL&mode=backtest&loops=6"
+```
+
 Example status request:
 
 ```bash
 curl \
   "https://<YOUR_FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/status?code=<FUNCTION_KEY>"
+```
+
+Download the current full log snapshot:
+
+```bash
+curl -L \
+  "https://<YOUR_FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/log?code=<FUNCTION_KEY>&log_file_path=<URL_ENCODED_LOG_FILE_PATH>&download=true" \
+  -o workflow.log
 ```
 
 Example log-tail request from your local terminal:

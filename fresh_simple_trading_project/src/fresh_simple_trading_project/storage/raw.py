@@ -22,12 +22,14 @@ class LocalRawStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def save_bars(self, symbol: str, timeframe: str, bars: pd.DataFrame) -> StorageRef:
+        """Persist raw bars to a local CSV file."""
         target = self.root / "bars" / f"{symbol}_{timeframe}_{timestamp_slug()}.csv"
         target.parent.mkdir(parents=True, exist_ok=True)
         bars.to_csv(target)
         return StorageRef(uri=target.resolve().as_uri(), kind="bars", content_type="text/csv")
 
     def save_news(self, symbol: str, articles: list[NewsArticle]) -> StorageRef:
+        """Persist raw news articles to a local JSON file."""
         target = self.root / "news" / f"{symbol}_{timestamp_slug()}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = [article.__dict__ for article in articles]
@@ -63,12 +65,14 @@ class AzureBlobRawStore:
 
     @property
     def blob_service_client(self) -> Any:
+        """Return the lazily constructed Azure Blob service client."""
         if self._blob_service_client is None:
             factory = self._blob_service_client_factory or _default_blob_service_client_factory
             self._blob_service_client = factory(self)
         return self._blob_service_client
 
     def save_bars(self, symbol: str, timeframe: str, bars: pd.DataFrame) -> StorageRef:
+        """Persist raw bars to Azure Blob Storage."""
         payload = bars.to_csv()
         blob_name = self._dated_blob_name(
             "bars",
@@ -79,6 +83,7 @@ class AzureBlobRawStore:
         return self._upload_text(blob_name, payload, kind="bars", content_type="text/csv")
 
     def save_news(self, symbol: str, articles: list[NewsArticle]) -> StorageRef:
+        """Persist raw news articles to Azure Blob Storage."""
         payload = json.dumps([article.__dict__ for article in articles], indent=2)
         blob_name = self._dated_blob_name(
             "news",

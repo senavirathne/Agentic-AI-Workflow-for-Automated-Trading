@@ -30,32 +30,6 @@ NEWS_SEARCH_FOCUS = [
 SYMBOL_NEWS_QUERY_TEMPLATE = "{symbol} stock market news"
 MACRO_NEWS_QUERY = "American economy inflation interest rates jobs GDP Federal Reserve"
 MARKET_NEWS_QUERY = "overall U.S. stock market trend S&P 500 Nasdaq Dow market breadth"
-MACRO_KEYWORDS = {
-    "american economy",
-    "economy",
-    "inflation",
-    "interest rate",
-    "rates",
-    "jobs",
-    "employment",
-    "gdp",
-    "federal reserve",
-    "fed",
-    "cpi",
-    "pce",
-}
-MARKET_KEYWORDS = {
-    "stock market",
-    "s&p 500",
-    "nasdaq",
-    "dow",
-    "market breadth",
-    "equities",
-    "wall street",
-    "rally",
-    "selloff",
-}
-MARKET_PROXY_SYMBOLS = ["SPY", "QQQ", "DIA", "IWM"]
 NEWS_AGENT_MAX_INPUT_CHARS = 12_000
 NEWS_AGENT_SEARCH_LIMIT_PER_QUERY = 40
 NEWS_AGENT_MAX_CRITICAL_ITEMS = 3
@@ -76,6 +50,7 @@ class NewsSearchClient(Protocol):
         *,
         input_size_chars: int | None = None,
     ) -> list[NewsArticle]:
+        """Return news articles for the supplied query."""
         ...
 
 
@@ -86,6 +61,8 @@ class StaticNewsSearchClient:
     articles: list[NewsArticle]
 
     def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
+        """Return the configured static article subset."""
+
         del input_size_chars
         return list(self.articles[:limit])
 
@@ -108,6 +85,8 @@ class AlphaVantageNewsSearchClient:
         *,
         input_size_chars: int | None = None,
     ) -> list[NewsArticle]:
+        """Search Alpha Vantage news and normalize the feed into articles."""
+
         self._last_request_succeeded = False
         self._last_request_cacheable = False
         try:
@@ -189,6 +168,8 @@ class WebSearchNewsClient:
     edition: str = "US:en"
 
     def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
+        """Search Google News RSS and normalize the resulting feed items."""
+
         del input_size_chars
         params = urlencode(
             {
@@ -238,6 +219,8 @@ class CombinedNewsSearchClient:
     clients: list[NewsSearchClient]
 
     def search_news(self, query: str, limit: int = 10, *, input_size_chars: int | None = None) -> list[NewsArticle]:
+        """Query each client and merge unique articles in provider order."""
+
         merged: list[NewsArticle] = []
         seen: set[str] = set()
         for client in self.clients:
@@ -267,6 +250,18 @@ class InformationRetrievalModule:
         input_size_chars: int | None = None,
         published_at_lte: datetime | str | None = None,
     ) -> RetrievalResult:
+        """Retrieve and summarize symbol, macro, and market news context.
+
+        Args:
+            symbol: Ticker symbol to gather news for.
+            limit: Maximum number of display headlines to keep.
+            input_size_chars: Optional prompt budget for article selection.
+            published_at_lte: Optional upper bound for backtest-safe news timestamps.
+
+        Returns:
+            A normalized retrieval result for downstream workflow stages.
+        """
+
         target_input_chars = input_size_chars or NEWS_AGENT_MAX_INPUT_CHARS
         queries = _build_news_queries(symbol)
         per_query_limit = max(limit, NEWS_AGENT_SEARCH_LIMIT_PER_QUERY, _target_article_count_for_input_size(target_input_chars))
@@ -709,22 +704,6 @@ def _extract_primary_ticker(item: dict[str, object]) -> tuple[str | None, float 
     if ticker is None:
         return None, None
     return ticker.upper(), primary_relevance
-
-
-def _filter_articles_by_keywords(
-    articles: list[NewsArticle],
-    keywords: set[str],
-    *,
-    limit: int,
-) -> list[NewsArticle]:
-    matches: list[NewsArticle] = []
-    for article in articles:
-        body = f"{article.headline} {article.summary}".lower()
-        if any(keyword in body for keyword in keywords):
-            matches.append(article)
-            if len(matches) >= limit:
-                return matches
-    return matches or articles[:limit]
 
 
 def _clean_html(raw: str | None) -> str:

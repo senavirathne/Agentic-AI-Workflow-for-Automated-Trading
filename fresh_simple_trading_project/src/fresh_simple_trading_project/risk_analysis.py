@@ -25,6 +25,8 @@ class RiskAnalysisModule:
         retrieval: RetrievalResult,
         previous_forecast: ForecastSnapshot | None = None,
     ) -> RiskResult:
+        """Score trade risk, size the position, and recommend protection levels."""
+
         risk_score = 0.2
         warnings: list[str] = []
         if eda.candle_volatility > self.config.risk_volatility_cutoff:

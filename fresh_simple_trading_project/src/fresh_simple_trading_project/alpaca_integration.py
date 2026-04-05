@@ -22,6 +22,7 @@ class AlpacaService:
 
     @cached_property
     def stock_data_client(self) -> Any:
+        """Return the lazily constructed Alpaca historical market-data client."""
         self.config.require()
         from alpaca.data.historical.stock import StockHistoricalDataClient
 
@@ -32,6 +33,7 @@ class AlpacaService:
 
     @cached_property
     def trading_client(self) -> Any:
+        """Return the lazily constructed Alpaca trading client."""
         self.config.require()
         from alpaca.trading.client import TradingClient
 
@@ -43,6 +45,7 @@ class AlpacaService:
         )
 
     def fetch_five_minute_bars(self, symbol: str, lookback_days: int=None) -> pd.DataFrame:
+        """Fetch recent 5-minute OHLCV bars from Alpaca."""
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -56,6 +59,7 @@ class AlpacaService:
         return _normalize_alpaca_bars(frame, symbol)
 
     def fetch_hourly_bars(self, symbol: str, lookback_days: int=None) -> pd.DataFrame:
+        """Fetch recent 1-hour OHLCV bars from Alpaca."""
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -75,10 +79,12 @@ class AlpacaService:
         *,
         lookback_days: int | None = None,
     ) -> float:
+        """Return the latest close at or before ``timestamp`` from Alpaca bars."""
         frame = self.fetch_five_minute_bars(symbol, lookback_days)
         return _close_price_at_or_before(frame, timestamp)
 
     def fetch_latest_trade(self, symbol: str) -> float:
+        """Fetch the latest trade price from Alpaca."""
         from alpaca.data.historical.stock import StockLatestTradeRequest
 
         request = StockLatestTradeRequest(symbol_or_symbols=symbol)
@@ -86,6 +92,7 @@ class AlpacaService:
         return float(response[symbol].price)
 
     def get_current_price(self, symbol: str) -> float:
+        """Fetch the current price from yfinance for delayed live workflows."""
         import yfinance as yf
 
         normalized_symbol = symbol.strip().upper()
@@ -103,12 +110,15 @@ class AlpacaService:
         return float(price)
 
     def get_clock(self) -> Any:
+        """Return the current Alpaca market clock."""
         return self.trading_client.get_clock()
 
     def get_buying_power(self) -> float:
+        """Return the account buying power reported by Alpaca."""
         return float(self.trading_client.get_account().buying_power)
 
     def get_open_position(self, symbol: str) -> tuple[bool, int, float | None]:
+        """Return whether a position is open plus quantity and average entry."""
         try:
             position = self.trading_client.get_open_position(symbol)
         except Exception:
@@ -117,6 +127,7 @@ class AlpacaService:
         return True, int(float(position.qty)), (float(avg_entry_price) if avg_entry_price is not None else None)
 
     def get_account_state(self, symbol: str) -> AccountState:
+        """Build the workflow account snapshot from Alpaca account state."""
         position_open, position_qty, avg_entry_price = self.get_open_position(symbol)
         clock = self.get_clock()
         account = self.trading_client.get_account()
@@ -192,6 +203,7 @@ class AlpacaService:
         )
 
     def submit_market_order(self, symbol: str, qty: int, side: str) -> str:
+        """Submit a market order through Alpaca and return its identifier."""
         from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
@@ -216,6 +228,7 @@ class AlpacaService:
         stop_loss_price: float | None,
         take_profit_price: float | None,
     ) -> list[str]:
+        """Replace Alpaca protective orders for ``symbol``."""
         self.clear_risk_orders(symbol)
         if qty <= 0:
             return []
@@ -266,6 +279,7 @@ class AlpacaService:
         return order_ids
 
     def clear_risk_orders(self, symbol: str) -> None:
+        """Cancel managed protective orders for ``symbol``."""
         from alpaca.trading.enums import OrderSide, QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
 
@@ -299,12 +313,15 @@ class AlpacaMarketDataClient:
     hourly_lookback_days: int = 7
 
     def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
+        """Fetch recent 5-minute bars through ``AlpacaService``."""
         return self.service.fetch_five_minute_bars(symbol, self.five_minute_lookback_days)
 
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
+        """Fetch recent hourly bars through ``AlpacaService``."""
         return self.service.fetch_hourly_bars(symbol, self.hourly_lookback_days)
 
     def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        """Return the latest Alpaca close at or before ``timestamp``."""
         return self.service.fetch_price_at_or_before(
             symbol,
             timestamp,
@@ -319,6 +336,7 @@ class AlpacaAccountClient:
     service: AlpacaService
 
     def get_account_state(self, symbol: str) -> AccountState:
+        """Return the current Alpaca-backed account state."""
         return self.service.get_account_state(symbol)
 
 
@@ -329,6 +347,7 @@ class AlpacaBrokerClient:
     service: AlpacaService
 
     def place_order(self, symbol: str, qty: int, side: str) -> str:
+        """Place a market order through ``AlpacaService``."""
         return self.service.submit_market_order(symbol, qty, side)
 
     def sync_risk_orders(
@@ -339,6 +358,7 @@ class AlpacaBrokerClient:
         stop_loss_price: float | None,
         take_profit_price: float | None,
     ) -> list[str]:
+        """Replace protective orders through ``AlpacaService``."""
         return self.service.sync_risk_orders(
             symbol,
             qty,
@@ -347,6 +367,7 @@ class AlpacaBrokerClient:
         )
 
     def clear_risk_orders(self, symbol: str) -> None:
+        """Cancel managed protective orders through ``AlpacaService``."""
         self.service.clear_risk_orders(symbol)
 
 

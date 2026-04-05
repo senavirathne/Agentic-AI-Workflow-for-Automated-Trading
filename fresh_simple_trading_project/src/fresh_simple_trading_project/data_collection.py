@@ -15,12 +15,15 @@ class MarketDataClient(Protocol):
     """Protocol for market-data providers that return bar history."""
 
     def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
+        """Return recent 5-minute OHLCV bars for ``symbol``."""
         ...
 
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
+        """Return recent 1-hour OHLCV bars for ``symbol``."""
         ...
 
     def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        """Return the latest close at or before ``timestamp``."""
         ...
 
 
@@ -28,6 +31,7 @@ class AccountClient(Protocol):
     """Protocol for account-state providers used by the workflow."""
 
     def get_account_state(self, symbol: str) -> AccountState:
+        """Return the current account state for ``symbol``."""
         ...
 
 
@@ -43,6 +47,7 @@ class SimulatedAccountClient:
     trade_count: int = 0
 
     def get_account_state(self, symbol: str) -> AccountState:
+        """Return the current simulated account snapshot."""
         return AccountState(
             cash=float(self.cash),
             position_qty=int(self.position_qty),
@@ -53,6 +58,7 @@ class SimulatedAccountClient:
         )
 
     def apply_fill(self, symbol: str, qty: int, side: str, price: float) -> AccountState:
+        """Apply a simulated fill and return the updated account state."""
         normalized_side = side.strip().upper()
         quantity = max(int(qty), 0)
         if quantity <= 0:
@@ -95,12 +101,15 @@ class StaticMarketDataClient:
     frame: pd.DataFrame
 
     def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
+        """Return the stored 5-minute frame."""
         return _normalize_ohlcv_bars(self.frame.copy())
 
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
+        """Return hourly bars resampled from the stored 5-minute frame."""
         return resample_to_hourly_bars(self.fetch_five_minute_bars(symbol))
 
     def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        """Return the latest close at or before ``timestamp`` from the static frame."""
         return _close_price_at_or_before(self.fetch_five_minute_bars(symbol), timestamp)
 
 
@@ -122,18 +131,23 @@ class HistoricalReplayDataClient:
             self.current_time = _normalize_end_timestamp(self.current_time)
 
     def fetch_five_minute_bars(self, symbol: str) -> pd.DataFrame:
+        """Return replayed 5-minute bars up to the current virtual time."""
         return self._slice_until(self.five_min_history)
 
     def fetch_hourly_bars(self, symbol: str) -> pd.DataFrame:
+        """Return replayed hourly bars up to the current virtual time."""
         return self._slice_until(self.hourly_history)
 
     def get_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        """Return the latest replayed close at or before ``timestamp``."""
         return _close_price_at_or_before(self._slice_until(self.five_min_history), timestamp)
 
     def advance_to(self, timestamp: pd.Timestamp) -> None:
+        """Advance the virtual replay clock to ``timestamp``."""
         self.current_time = _normalize_end_timestamp(timestamp)
 
     def reset(self) -> None:
+        """Reset the virtual replay clock to the start of the dataset."""
         self.current_time = None
 
     def _slice_until(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -150,15 +164,19 @@ class DataCollectionModule:
     account_client: AccountClient
 
     def fetch_history(self, symbol: str) -> pd.DataFrame:
+        """Return the indicator-history window for ``symbol``."""
         return self.fetch_indicator_bars(symbol)
 
     def fetch_five_minute_history(self, symbol: str) -> pd.DataFrame:
+        """Return the underlying 5-minute history for ``symbol``."""
         return self.market_data_client.fetch_five_minute_bars(symbol)
 
     def fetch_hourly_history(self, symbol: str) -> pd.DataFrame:
+        """Return the underlying hourly history for ``symbol``."""
         return self.market_data_client.fetch_hourly_bars(symbol)
 
     def fetch_price_at_or_before(self, symbol: str, timestamp: pd.Timestamp | str) -> float:
+        """Return the latest available close at or before ``timestamp``."""
         return float(self.market_data_client.get_price_at_or_before(symbol, timestamp))
 
     def fetch_sr_bars(
@@ -169,6 +187,7 @@ class DataCollectionModule:
         end_time: pd.Timestamp | str | None = None,
         source_hourly_bars: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        """Return the hourly support/resistance window for ``symbol``."""
         hourly = source_hourly_bars if source_hourly_bars is not None else self.fetch_hourly_history(symbol)
         return _slice_window(hourly, end_time=end_time, window=pd.Timedelta(days=lookback_days))
 
@@ -180,6 +199,7 @@ class DataCollectionModule:
         end_time: pd.Timestamp | str | None = None,
         source_five_minute_bars: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        """Return the 5-minute indicator window for ``symbol``."""
         five_minute = (
             source_five_minute_bars
             if source_five_minute_bars is not None
@@ -192,6 +212,7 @@ class DataCollectionModule:
         symbol: str,
         config: TradingConfig,
     ) -> CollectedMarketData:
+        """Collect the latest workflow-ready snapshot for ``symbol``."""
         return self.collect_until(
             symbol,
             config,
@@ -205,6 +226,7 @@ class DataCollectionModule:
         source_five_minute_bars: pd.DataFrame | None = None,
         source_hourly_bars: pd.DataFrame | None = None,
     ) -> CollectedMarketData:
+        """Collect a workflow-ready snapshot sliced to an optional checkpoint."""
         five_minute_bars = self.fetch_indicator_bars(
             symbol,
             lookback_hours=config.indicator_lookback_hours,

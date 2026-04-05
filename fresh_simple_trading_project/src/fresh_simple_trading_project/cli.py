@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
-import os
 from pathlib import Path
 
 from .alpha_vantage import AlphaVantageIndicatorService
@@ -39,14 +38,13 @@ def main() -> None:
     alpha_vantage_cmd.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
-    _override_runtime_env(mode=getattr(args, "mode", None), symbol=getattr(args, "symbol", None))
     project_root = _resolve_project_root()
 
     if args.command == "alpha-vantage-indicators":
         _print_alpha_vantage_snapshot(symbol=args.symbol, project_root=project_root)
         return
 
-    workflow = build_workflow(project_root=project_root)
+    workflow = build_workflow(project_root=project_root, mode=getattr(args, "mode", None))
 
     if args.command == "run":
         results = workflow.run_loop(
@@ -63,14 +61,6 @@ def main() -> None:
         print(json.dumps(_trade_once_payload(workflow.settings.trading.mode, result), indent=2))
         return
     print(_format_trade_once_output(workflow.settings.trading.mode, result))
-
-
-def _override_runtime_env(*, mode: str | None, symbol: str | None) -> None:
-    """Apply CLI overrides through environment variables before settings load."""
-    if mode:
-        os.environ["RUN_MODE"] = mode
-    if symbol:
-        os.environ["TRADING_SYMBOL"] = symbol.upper()
 
 
 def _resolve_project_root(start: Path | None = None) -> Path:

@@ -16,7 +16,7 @@ from .alpaca_integration import (
     AlpacaMarketDataClient,
     AlpacaService,
 )
-from .config import RunMode, Settings
+from .config import LLMConfig, RunMode, Settings
 from .data_collection import (
     DataCollectionModule,
     HistoricalReplayDataClient,
@@ -32,16 +32,22 @@ from .information_retrieval import (
     InformationRetrievalModule,
     WebSearchNewsClient,
 )
-from .llm import DeepSeekLLMClient, FallbackLLMClient, LLMRequestError, OpenAILLMClient, TextGenerationClient
+from .llm import (
+    FallbackLLMClient,
+    LLMRequestError,
+    OpenAICompatibleLLMClient,
+    OpenAILLMClient,
+    TextGenerationClient,
+)
 from .market_analysis import MarketAnalysisModule
 from .models import AlphaVantageIndicatorSnapshot, CollectedMarketData, ForecastSnapshot, PerformanceSnapshot, WorkflowResult
 from .reporting import (
-    _artifact_location,
-    _display_reason,
-    _print_collected_windows,
-    _print_indicator_context,
-    _print_labeled_items,
-    _print_reasoning,
+    artifact_location,
+    display_reason,
+    print_collected_windows,
+    print_indicator_context,
+    print_labeled_items,
+    print_reasoning,
     format_reasoning_lines,
 )
 from .risk_analysis import RiskAnalysisModule
@@ -79,6 +85,16 @@ class TradingWorkflow:
     _alpha_vantage_preloaded_symbols: set[str] = field(default_factory=set, init=False, repr=False)
 
     def run_once(self, symbol: str | None = None, execute_orders: bool = False) -> WorkflowResult:
+        """Run a single workflow iteration for the requested symbol.
+
+        Args:
+            symbol: Optional symbol override for this run.
+            execute_orders: Whether the execution stage should place orders.
+
+        Returns:
+            The complete workflow result for the processed checkpoint.
+        """
+
         target_symbol = (symbol or self.settings.trading.symbol).upper()
         print(f"[Workflow] stating {self.settings.trading.mode.value} workflow for {target_symbol}...")
         self._ensure_backtest_alpha_vantage_data(target_symbol)
@@ -116,8 +132,8 @@ class TradingWorkflow:
         )
         print(
             f"[Workflow] Raw artifacts saved: "
-            f"5min={_artifact_location(raw_artifacts['five_minute_bars'])} | "
-            f"1h={_artifact_location(raw_artifacts['hourly_bars'])}"
+            f"5min={artifact_location(raw_artifacts['five_minute_bars'])} | "
+            f"1h={artifact_location(raw_artifacts['hourly_bars'])}"
         )
         eda = self.eda_module.summarize(
             symbol,
@@ -128,7 +144,7 @@ class TradingWorkflow:
             f"volatility={eda.candle_volatility:.4f} | anomalies={eda.anomaly_count} | missing={eda.missing_values}"
         )
         feature_frame, alpha_vantage_snapshot, indicator_source = self._build_indicator_context(symbol, collected)
-        _print_indicator_context(alpha_vantage_snapshot, indicator_source=indicator_source, feature_frame=feature_frame)
+        print_indicator_context(alpha_vantage_snapshot, indicator_source=indicator_source, feature_frame=feature_frame)
         price_at_timestamp = self._resolve_price_at_analysis_time(symbol, collected)
         market_data_delay_minutes = self._market_data_delay_minutes()
         current_price = self._fetch_live_current_price(symbol, market_data_delay_minutes)
@@ -152,7 +168,7 @@ class TradingWorkflow:
             f"entry_setup={analysis.entry_setup} | exit_setup={analysis.exit_setup} | "
             f"latest_price={analysis.latest_price:.2f} | confidence={analysis.confidence:.2f}"
         )
-        print(f"[Workflow] Technical agent output: {_display_reason(analysis.llm_summary)}")
+        print(f"[Workflow] Technical agent output: {display_reason(analysis.llm_summary)}")
         news_published_at_lte = self._news_published_at_lte(symbol, collected.five_minute_bars.index[-1])
         retrieval = self._run_llm_stage(
             "information_retrieval",
@@ -168,10 +184,10 @@ class TradingWorkflow:
             f"[Workflow] Information retrieval finished: articles={len(retrieval.articles)} | "
             f"critical_news={len(retrieval.critical_news)} | catalysts={len(retrieval.catalysts)}"
         )
-        print(f"[Workflow] News artifact saved: {_artifact_location(raw_artifacts['news'])}")
-        print(f"[Workflow] News agent output: {_display_reason(retrieval.summary_note)}")
-        _print_labeled_items("Critical news", retrieval.critical_news)
-        _print_labeled_items("Headline", retrieval.headline_summary)
+        print(f"[Workflow] News artifact saved: {artifact_location(raw_artifacts['news'])}")
+        print(f"[Workflow] News agent output: {display_reason(retrieval.summary_note)}")
+        print_labeled_items("Critical news", retrieval.critical_news)
+        print_labeled_items("Headline", retrieval.headline_summary)
         risk = self._run_llm_stage(
             "risk_analysis",
             symbol,
@@ -189,8 +205,8 @@ class TradingWorkflow:
             f"can_enter={risk.can_enter} | recommended_qty={risk.recommended_qty} | "
             f"stop_loss={risk.stop_loss_price} | take_profit={risk.take_profit_price}"
         )
-        print(f"[Workflow] Risk agent output: {_display_reason(risk.summary_note)}")
-        _print_labeled_items("Risk warning", risk.warnings)
+        print(f"[Workflow] Risk agent output: {display_reason(risk.summary_note)}")
+        print_labeled_items("Risk warning", risk.warnings)
         decision = self._run_llm_stage(
             "decision_engine",
             symbol,
@@ -206,7 +222,7 @@ class TradingWorkflow:
             f"[Workflow] Decision engine finished: action={decision.action.value} | "
             f"quantity={decision.quantity} | confidence={decision.confidence:.2f}"
         )
-        _print_labeled_items("Decision reason", decision.rationale)
+        print_labeled_items("Decision reason", decision.rationale)
         _set_broker_market_price(
             self.execution_module.broker_client,
             symbol=symbol,
@@ -244,7 +260,7 @@ class TradingWorkflow:
             previous_forecast=previous_forecast,
         )
         if hold_forecast is not None:
-            print(f"[Workflow] Hold forecast generated: {_display_reason(hold_forecast.summary)}")
+            print(f"[Workflow] Hold forecast generated: {display_reason(hold_forecast.summary)}")
         result = WorkflowResult(
             symbol=symbol,
             five_minute_bars=collected.five_minute_bars,
@@ -479,6 +495,8 @@ class TradingWorkflow:
         symbol: str | None = None,
         execute_orders: bool = False,
     ) -> list[WorkflowResult]:
+        """Run the workflow across an explicit backtest time range."""
+
         target_symbol = (symbol or self.settings.trading.symbol).upper()
         self._ensure_backtest_alpha_vantage_data(target_symbol)
         should_execute_orders = self._should_execute_orders(execute_orders)
@@ -490,7 +508,7 @@ class TradingWorkflow:
                 self.settings.trading,
                 end_time=checkpoint,
             )
-            _print_collected_windows(collected)
+            print_collected_windows(collected)
             results.append(self._run_collected(target_symbol, collected, should_execute_orders))
         return results
 
@@ -501,6 +519,8 @@ class TradingWorkflow:
         max_iterations: int | None = None,
         sleep_seconds: float | None = None,
     ) -> list[WorkflowResult]:
+        """Run the workflow loop until exhausted or ``max_iterations`` is reached."""
+
         target_symbol = (symbol or self.settings.trading.symbol).upper()
         self._ensure_backtest_alpha_vantage_data(target_symbol)
         mode = self.settings.trading.mode
@@ -558,13 +578,13 @@ class TradingWorkflow:
                 )
             else:
                 collected = self.data_collection.collect(target_symbol, self.settings.trading)
-            _print_collected_windows(collected)
+            print_collected_windows(collected)
             result = self._run_collected(target_symbol, collected, should_execute_orders)
             print(
                 f"[Workflow] Decision: {result.decision.action.value} "
                 f"(Qty: {result.decision.quantity}) | Executed: {result.execution.status}"
             )
-            _print_reasoning(result)
+            print_reasoning(result)
             results.append(result)
             iteration += 1
 
@@ -610,6 +630,8 @@ class TradingWorkflow:
         return execute_orders or self.settings.trading.mode == RunMode.BACKTEST
 
     def _ensure_backtest_alpha_vantage_data(self, symbol: str) -> None:
+        """Preload required Alpha Vantage day snapshots for backtest replays."""
+
         if not self._uses_backtest_alpha_vantage_indicators():
             return
 
@@ -618,57 +640,81 @@ class TradingWorkflow:
             return
 
         source_bars = self.data_collection.fetch_five_minute_history(normalized_symbol)
+        required_trading_days = self._required_backtest_alpha_vantage_trading_days(source_bars.index)
+        coverage_helper = getattr(self.alpha_vantage_service, "ensure_backtest_coverage", None)
+        if callable(coverage_helper):
+            coverage_helper(
+                normalized_symbol,
+                source_bars=source_bars,
+                required_trading_days=required_trading_days,
+                result_store=self.result_store,
+                database_path=self.settings.paths.database_path,
+                cache_path=self.settings.paths.data_dir / "alpha_vantage",
+            )
+        else:
+            self._ensure_backtest_alpha_vantage_data_legacy(
+                normalized_symbol,
+                source_bars=source_bars,
+                required_trading_days=required_trading_days,
+            )
+        self._alpha_vantage_preloaded_symbols.add(normalized_symbol)
+
+    def _ensure_backtest_alpha_vantage_data_legacy(
+        self,
+        symbol: str,
+        *,
+        source_bars: pd.DataFrame,
+        required_trading_days: list[str],
+    ) -> None:
         if source_bars.empty:
-            raise ValueError(f"No 5-minute bars available for {normalized_symbol}")
+            raise ValueError(f"No 5-minute bars available for {symbol}")
 
         start_time = pd.Timestamp(source_bars.index.min())
         end_time = pd.Timestamp(source_bars.index.max())
-        required_trading_days = self._required_backtest_alpha_vantage_trading_days(source_bars.index)
-        trading_day_count = len(required_trading_days)
         interval = self.settings.alpha_vantage.interval or "5min"
         database_path = self.settings.paths.database_path.resolve()
         cache_path = (self.settings.paths.data_dir / "alpha_vantage").resolve()
         print(
-            f"[Workflow] Alpha Vantage backtest preflight: ensuring local storage coverage for {normalized_symbol} "
-            f"across {trading_day_count} trading day(s) | db={database_path} | cache={cache_path}"
+            f"[Workflow] Alpha Vantage backtest preflight: ensuring local storage coverage for {symbol} "
+            f"across {len(required_trading_days)} trading day(s) | db={database_path} | cache={cache_path}"
         )
         self._sync_backtest_alpha_vantage_snapshots_from_local_cache(
-            normalized_symbol,
+            symbol,
             required_trading_days=required_trading_days,
             interval=interval,
         )
         missing_days = self._missing_backtest_alpha_vantage_snapshot_days(
-            normalized_symbol,
+            symbol,
             required_trading_days=required_trading_days,
             interval=interval,
         )
         if missing_days:
             self.alpha_vantage_service.ensure_data_for_window(
-                normalized_symbol,
+                symbol,
                 start_time=start_time,
                 end_time=end_time,
                 required_trading_days=required_trading_days,
             )
             self._sync_backtest_alpha_vantage_snapshots_from_local_cache(
-                normalized_symbol,
+                symbol,
                 required_trading_days=required_trading_days,
                 interval=interval,
             )
             missing_days = self._missing_backtest_alpha_vantage_snapshot_days(
-                normalized_symbol,
+                symbol,
                 required_trading_days=required_trading_days,
                 interval=interval,
             )
         if missing_days:
             partial_coverage = self._resolve_backtest_alpha_vantage_partial_coverage(
-                normalized_symbol,
+                symbol,
                 required_trading_days=required_trading_days,
                 interval=interval,
             )
             if partial_coverage is None:
                 raise RuntimeError(
                     "Alpha Vantage backtest data is still missing from the local store after preload. "
-                    f"Missing {normalized_symbol} {interval} trading day snapshots: {missing_days}. "
+                    f"Missing {symbol} {interval} trading day snapshots: {missing_days}. "
                     f"DB path: {database_path}"
                 )
             latest_snapshot, trailing_missing_days = partial_coverage
@@ -678,12 +724,11 @@ class TradingWorkflow:
                 f"using the latest available snapshot through {latest_timestamp.isoformat()} "
                 f"and skipping trailing unavailable trading day(s): {trailing_missing_days}."
             )
-        else:
-            print(
-                "[Workflow] Alpha Vantage backtest preload finished: required indicator snapshots and 1-hour chunks "
-                f"are available in the local store at {database_path}."
-            )
-        self._alpha_vantage_preloaded_symbols.add(normalized_symbol)
+            return
+        print(
+            "[Workflow] Alpha Vantage backtest preload finished: required indicator snapshots and 1-hour chunks "
+            f"are available in the local store at {database_path}."
+        )
 
     def _missing_backtest_alpha_vantage_snapshot_days(
         self,
@@ -710,9 +755,6 @@ class TradingWorkflow:
         required_trading_days: list[str],
         interval: str,
     ) -> list[str]:
-        if self.alpha_vantage_service is None:
-            return []
-
         hydrated_days: list[str] = []
         for trading_day in required_trading_days:
             existing = self.result_store.load_alpha_vantage_indicator_snapshot(
@@ -904,7 +946,15 @@ def build_workflow(
     project_root: Path | None = None,
     mode: RunMode | str | None = None,
 ) -> TradingWorkflow:
-    """Construct a fully wired workflow from project settings."""
+    """Construct a fully wired workflow from project settings.
+
+    Args:
+        project_root: Optional project root used for env and storage resolution.
+        mode: Optional run-mode override applied after loading settings.
+
+    Returns:
+        A ready-to-run ``TradingWorkflow`` instance.
+    """
     settings = Settings.from_env(project_root=project_root)
     if mode is not None:
         settings = replace(
@@ -982,10 +1032,10 @@ def build_workflow(
 
 def _build_llm_client(settings: Settings) -> TextGenerationClient:
     """Build the configured primary/secondary LLM stack."""
-    primary = DeepSeekLLMClient(settings.llm) if settings.llm.enabled else None
+    primary = _build_openai_compatible_llm_client(settings.llm) if settings.llm.enabled else None
     secondary_config = settings.secondary_llm
     secondary = (
-        OpenAILLMClient(secondary_config)
+        _build_openai_compatible_llm_client(secondary_config)
         if secondary_config is not None and secondary_config.enabled
         else None
     )
@@ -994,9 +1044,15 @@ def _build_llm_client(settings: Settings) -> TextGenerationClient:
     if primary is not None:
         return primary
     if secondary is not None:
-        return secondary
+        return OpenAILLMClient(secondary_config)
     settings.require_llm()
     raise RuntimeError("At least one LLM client must be configured.")
+
+
+def _build_openai_compatible_llm_client(config: LLMConfig) -> OpenAICompatibleLLMClient:
+    """Build the shared OpenAI-compatible client used by workflow wiring."""
+
+    return OpenAICompatibleLLMClient(config)
 
 
 def _build_live_workflow(
@@ -1014,30 +1070,21 @@ def _build_live_workflow(
     news_client: CombinedNewsSearchClient,
 ) -> TradingWorkflow:
     market_data_client, account_client, broker_client = _build_live_clients(settings, alpaca_service)
-    return TradingWorkflow(
+    return _build_trading_workflow(
         settings=settings,
-        data_collection=DataCollectionModule(
-            market_data_client=market_data_client,
-            account_client=account_client,
-        ),
-        eda_module=EDAModule(),
-        feature_engineering=FeatureEngineeringModule(settings.trading),
-        market_analysis=MarketAnalysisModule(settings.trading, technical_agent=technical_agent),
-        information_retrieval=InformationRetrievalModule(
-            news_client,
-            news_agent=news_agent,
-            news_archive=result_store,
-            max_article_age_days=settings.news.max_age_days,
-        ),
-        risk_analysis=RiskAnalysisModule(settings.trading, risk_agent=risk_agent),
-        decision_engine=DecisionEngine(decision_agent=decision_agent),
-        execution_module=ExecutionModule(broker_client),
+        market_data_client=market_data_client,
+        account_client=account_client,
+        broker_client=broker_client,
+        technical_agent=technical_agent,
+        news_agent=news_agent,
+        risk_agent=risk_agent,
+        decision_agent=decision_agent,
+        hold_forecast_agent=hold_forecast_agent,
+        news_client=news_client,
         raw_store=raw_store,
         result_store=result_store,
         alpha_vantage_service=alpha_vantage_service,
         alpaca_service=alpaca_service,
-        hold_forecast_agent=hold_forecast_agent,
-        default_sleep_seconds=settings.trading.sleep_seconds,
     )
 
 
@@ -1056,6 +1103,41 @@ def _build_backtest_workflow(
     news_client: CombinedNewsSearchClient,
 ) -> TradingWorkflow:
     market_data_client, account_client, broker_client = _build_backtest_clients(settings, alpaca_service)
+    return _build_trading_workflow(
+        settings=settings,
+        market_data_client=market_data_client,
+        account_client=account_client,
+        broker_client=broker_client,
+        technical_agent=technical_agent,
+        news_agent=news_agent,
+        risk_agent=risk_agent,
+        decision_agent=decision_agent,
+        hold_forecast_agent=hold_forecast_agent,
+        news_client=news_client,
+        raw_store=raw_store,
+        result_store=result_store,
+        alpha_vantage_service=alpha_vantage_service,
+        alpaca_service=alpaca_service,
+    )
+
+
+def _build_trading_workflow(
+    *,
+    settings: Settings,
+    market_data_client,
+    account_client,
+    broker_client,
+    technical_agent: TechnicalAnalysisAgent,
+    news_agent: NewsResearchAgent,
+    risk_agent: RiskReviewAgent,
+    decision_agent: DecisionCoordinatorAgent,
+    hold_forecast_agent: HoldForecastAgent,
+    news_client: CombinedNewsSearchClient,
+    raw_store: RawStore,
+    result_store: ResultStore,
+    alpha_vantage_service: AlphaVantageIndicatorService | None,
+    alpaca_service: AlpacaService | None,
+) -> TradingWorkflow:
     return TradingWorkflow(
         settings=settings,
         data_collection=DataCollectionModule(

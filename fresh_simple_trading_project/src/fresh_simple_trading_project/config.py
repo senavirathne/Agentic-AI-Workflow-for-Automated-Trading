@@ -273,31 +273,32 @@ class Settings:
             run_mode=run_mode,
             env_var_name=market_provider_env,
         )
-        legacy_lookback_hours = max(1, int(env.get("LOOKBACK_HOURS", "24")))
-        legacy_sr_lookback_days = max(
-            1,
-            int(env.get("SUPPORT_RESISTANCE_LOOKBACK_DAYS", "7")),
-        )
+        legacy_lookback_hours = _env_int(env, "LOOKBACK_HOURS", 24, minimum=1)
+        legacy_sr_lookback_days = _env_int(env, "SUPPORT_RESISTANCE_LOOKBACK_DAYS", 7, minimum=1)
         return cls(
             trading=TradingConfig(
                 symbol=env.get("TRADING_SYMBOL", "AAPL").upper(),
                 mode=run_mode,
-                live_market_data_delay_minutes=max(0, int(env.get("LIVE_MARKET_DATA_DELAY_MINUTES", "15"))),
-                lookback_hours=max(1, int(env.get("LOOKBACK_HOURS", "240"))),
-                eda_window_hours=max(1, int(env.get("EDA_WINDOW_HOURS", "24"))),
-                sr_lookback_days=max(
-                    1,
-                    int(env.get("SR_LOOKBACK_DAYS", str(legacy_sr_lookback_days))),
+                live_market_data_delay_minutes=_env_int(
+                    env,
+                    "LIVE_MARKET_DATA_DELAY_MINUTES",
+                    15,
+                    minimum=0,
                 ),
+                lookback_hours=_env_int(env, "LOOKBACK_HOURS", 240, minimum=1),
+                eda_window_hours=_env_int(env, "EDA_WINDOW_HOURS", 24, minimum=1),
+                sr_lookback_days=_env_int(env, "SR_LOOKBACK_DAYS", legacy_sr_lookback_days, minimum=1),
                 sr_timeframe=env.get("SR_TIMEFRAME", "1h"),
-                indicator_lookback_hours=max(
-                    1,
-                    int(env.get("INDICATOR_LOOKBACK_HOURS", str(legacy_lookback_hours))),
+                indicator_lookback_hours=_env_int(
+                    env,
+                    "INDICATOR_LOOKBACK_HOURS",
+                    legacy_lookback_hours,
+                    minimum=1,
                 ),
                 indicator_timeframe=env.get("INDICATOR_TIMEFRAME", "5min"),
-                backtest_history_days=max(8, int(env.get("BACKTEST_HISTORY_DAYS", "30"))),
-                live_sleep_seconds=max(0.0, float(env.get("LIVE_SLEEP_SECONDS", "3600.0"))),
-                backtest_sleep_seconds=max(0.0, float(env.get("BACKTEST_SLEEP_SECONDS", "1.0"))),
+                backtest_history_days=_env_int(env, "BACKTEST_HISTORY_DAYS", 30, minimum=8),
+                live_sleep_seconds=_env_float(env, "LIVE_SLEEP_SECONDS", 3600.0, minimum=0.0),
+                backtest_sleep_seconds=_env_float(env, "BACKTEST_SLEEP_SECONDS", 1.0, minimum=0.0),
             ),
             market_data=MarketDataConfig(provider=market_provider),
             raw_store=RawStoreConfig(provider=_resolve_raw_store_provider(env.get("RAW_STORE_PROVIDER"))),
@@ -309,8 +310,13 @@ class Settings:
                 api_key=env.get("ALPHA_VANTAGE_API_KEY"),
                 base_url=env.get("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"),
                 interval=env.get("ALPHA_VANTAGE_INTERVAL", "5min"),
-                request_pause_seconds=max(0.0, float(env.get("ALPHA_VANTAGE_CALL_PAUSE_SECONDS", "15.0"))),
-                max_retries=max(1, int(env.get("ALPHA_VANTAGE_MAX_RETRIES", "3"))),
+                request_pause_seconds=_env_float(
+                    env,
+                    "ALPHA_VANTAGE_CALL_PAUSE_SECONDS",
+                    15.0,
+                    minimum=0.0,
+                ),
+                max_retries=_env_int(env, "ALPHA_VANTAGE_MAX_RETRIES", 3, minimum=1),
             ),
             azure=AzureConfig(
                 storage_account_url=env.get("AZURE_STORAGE_ACCOUNT_URL"),
@@ -321,30 +327,67 @@ class Settings:
             ),
             alpaca=alpaca,
             news=NewsConfig(
-                max_age_days=max(1, int(env.get("NEWS_MAX_AGE_DAYS", "7"))),
+                max_age_days=_env_int(env, "NEWS_MAX_AGE_DAYS", 7, minimum=1),
             ),
-            llm=LLMConfig(
+            llm=_llm_config_from_env(
+                env,
                 provider="deepseek",
                 provider_label="DeepSeek",
-                api_key=env.get("DEEPSEEK_API_KEY"),
-                base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-                model=env.get("DEEPSEEK_MODEL", "deepseek-reasoner"),
-                timeout_seconds=float(env.get("LLM_TIMEOUT_SECONDS", "45.0")),
-                show_progress=_parse_bool(env.get("LLM_SHOW_PROGRESS"), True),
-                heartbeat_seconds=float(env.get("LLM_HEARTBEAT_SECONDS", "5.0")),
+                api_key_env="DEEPSEEK_API_KEY",
+                base_url_env="DEEPSEEK_BASE_URL",
+                default_base_url="https://api.deepseek.com",
+                model_env="DEEPSEEK_MODEL",
+                default_model="deepseek-reasoner",
             ),
-            secondary_llm=LLMConfig(
+            secondary_llm=_llm_config_from_env(
+                env,
                 provider="openai",
                 provider_label="OpenAI",
-                api_key=env.get("OPENAI_API_KEY"),
-                base_url=env.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-                model=env.get("OPENAI_MODEL", "gpt-5.4-mini"),
-                timeout_seconds=float(env.get("LLM_TIMEOUT_SECONDS", "45.0")),
-                show_progress=_parse_bool(env.get("LLM_SHOW_PROGRESS"), True),
-                heartbeat_seconds=float(env.get("LLM_HEARTBEAT_SECONDS", "5.0")),
+                api_key_env="OPENAI_API_KEY",
+                base_url_env="OPENAI_BASE_URL",
+                default_base_url="https://api.openai.com/v1",
+                model_env="OPENAI_MODEL",
+                default_model="gpt-5.4-mini",
             ),
             paths=paths,
         )
+
+
+def _env_int(env: dict[str, str], key: str, default: int, *, minimum: int) -> int:
+    """Parse and clamp an integer environment setting."""
+
+    return max(minimum, int(env.get(key, str(default))))
+
+
+def _env_float(env: dict[str, str], key: str, default: float, *, minimum: float) -> float:
+    """Parse and clamp a float environment setting."""
+
+    return max(minimum, float(env.get(key, str(default))))
+
+
+def _llm_config_from_env(
+    env: dict[str, str],
+    *,
+    provider: str,
+    provider_label: str,
+    api_key_env: str,
+    base_url_env: str,
+    default_base_url: str,
+    model_env: str,
+    default_model: str,
+) -> LLMConfig:
+    """Build one provider-specific ``LLMConfig`` from environment variables."""
+
+    return LLMConfig(
+        provider=provider,
+        provider_label=provider_label,
+        api_key=env.get(api_key_env),
+        base_url=env.get(base_url_env, default_base_url),
+        model=env.get(model_env, default_model),
+        timeout_seconds=_env_float(env, "LLM_TIMEOUT_SECONDS", 45.0, minimum=0.0),
+        show_progress=_parse_bool(env.get("LLM_SHOW_PROGRESS"), True),
+        heartbeat_seconds=_env_float(env, "LLM_HEARTBEAT_SECONDS", 5.0, minimum=0.0),
+    )
 
 
 def _parse_run_mode(raw: str | None) -> RunMode:

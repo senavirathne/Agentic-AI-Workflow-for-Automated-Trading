@@ -25,6 +25,8 @@ class DecisionEngine:
         risk: RiskResult,
         previous_forecast: ForecastSnapshot | None = None,
     ) -> Decision:
+        """Decide whether to buy, sell, or hold for the current checkpoint."""
+
         rule_based_decision = self._rule_based_decision(account, analysis, retrieval, risk, previous_forecast)
         return self._apply_llm_review(rule_based_decision, account, analysis, retrieval, risk, previous_forecast)
 

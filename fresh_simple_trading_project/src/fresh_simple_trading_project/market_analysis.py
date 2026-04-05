@@ -14,7 +14,7 @@ from .utils import _as_utc_timestamp, _format_region, _region_midpoint
 
 @dataclass
 class MarketAnalysisModule:
-    """Create the technical analysis snapshot used by later workflow stages."""
+    """Build the technical analysis snapshot used by later workflow stages."""
 
     config: TradingConfig
     technical_agent: TechnicalAnalysisAgent | None = None
@@ -31,6 +31,24 @@ class MarketAnalysisModule:
         indicator_source: str = "manually computed indicators from 5-minute bar data",
         previous_forecast: ForecastSnapshot | None = None,
     ) -> AnalysisResult:
+        """Analyze the latest market state for one symbol.
+
+        Args:
+            symbol: Ticker being analyzed.
+            feature_frame: Engineered 5-minute feature frame used for signals.
+            hourly_bars: Optional 1-hour bar window used for major price levels.
+            alpha_vantage_snapshot: Optional aligned Alpha Vantage snapshot for backtests.
+            price_at_timestamp: Price to treat as the managed execution price at the
+                analysis timestamp.
+            current_price: Optional live current price for delayed-data workflows.
+            market_data_delay_minutes: Delay applied to live market-data bars.
+            indicator_source: Short label describing how indicators were produced.
+            previous_forecast: Prior HOLD forecast to reference in the notes.
+
+        Returns:
+            The normalized technical analysis result for downstream modules.
+        """
+
         latest = feature_frame.iloc[-1]
         analysis_timestamp = _as_utc_timestamp(feature_frame.index[-1])
         major_frame = hourly_bars if hourly_bars is not None and not hourly_bars.empty else feature_frame

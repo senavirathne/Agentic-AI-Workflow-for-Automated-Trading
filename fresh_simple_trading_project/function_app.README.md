@@ -55,9 +55,10 @@ tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260
 
 ## Endpoints
 
-- `POST /api/trading/vm/start`
+- `GET|POST /api/trading/vm/start`
 - `GET /api/trading/vm/status`
 - `GET /api/trading/vm/log`
+- Compatibility aliases: `/api/trading/session/start`, `/api/trading/session/status`, `/api/trading/session/log`
 
 Example:
 
@@ -66,6 +67,13 @@ curl -X POST \
   "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/start?code=<FUNCTION_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"symbol":"AAPL","mode":"backtest","loops":3,"live_after_backtest":true}'
+```
+
+Equivalent GET request:
+
+```bash
+curl \
+  "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/start?code=<FUNCTION_KEY>&symbol=AAPL&mode=backtest&loops=3"
 ```
 
 Fetch the latest saved log tail from your local terminal:
@@ -80,4 +88,12 @@ Fetch a specific number of log lines:
 ```bash
 curl \
   "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/log?code=<FUNCTION_KEY>&lines=120"
+```
+
+Download the full log file snapshot:
+
+```bash
+curl -L \
+  "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/log?code=<FUNCTION_KEY>&log_file_path=<URL_ENCODED_LOG_FILE_PATH>&download=true" \
+  -o workflow.log
 ```

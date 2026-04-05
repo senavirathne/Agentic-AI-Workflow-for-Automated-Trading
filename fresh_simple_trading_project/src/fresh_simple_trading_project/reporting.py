@@ -7,23 +7,37 @@ import pandas as pd
 from .models import AlphaVantageIndicatorSnapshot, CollectedMarketData, WorkflowResult
 
 
-def _print_collected_windows(collected: CollectedMarketData) -> None:
+def print_collected_windows(collected: CollectedMarketData) -> None:
+    """Print the collected 5-minute and hourly data windows."""
+
     print(f"[Workflow] Indicator window (5min): {_frame_window(collected.five_minute_bars)}")
     print(f"[Workflow] Support/Resistance window (1h): {_frame_window(collected.hourly_bars)}")
 
 
-def _print_reasoning(result: WorkflowResult) -> None:
+def print_reasoning(result: WorkflowResult) -> None:
+    """Print the formatted reasoning summary for a workflow result."""
+
     for line in format_reasoning_lines(result):
         print(line)
 
 
 def format_reasoning_lines(result: WorkflowResult, prefix: str = "  ") -> list[str]:
+    """Format reasoning lines for CLI or loop logging output.
+
+    Args:
+        result: Workflow result to summarize.
+        prefix: Prefix added to each rendered line.
+
+    Returns:
+        A list of human-readable reasoning lines.
+    """
+
     lines = [
         f"{prefix}Data Window: {_data_window(result)}",
         f"{prefix}Alpha Vantage: {_alpha_vantage_window(result)}",
-        f"{prefix}Technical Agent: {_display_reason(result.analysis.llm_summary)}",
-        f"{prefix}News Agent: {_display_reason(result.retrieval.summary_note)}",
-        f"{prefix}Risk Agent: {_display_reason(result.risk.summary_note)}",
+        f"{prefix}Technical Agent: {display_reason(result.analysis.llm_summary)}",
+        f"{prefix}News Agent: {display_reason(result.retrieval.summary_note)}",
+        f"{prefix}Risk Agent: {display_reason(result.risk.summary_note)}",
     ]
     if result.performance is not None:
         lines.append(
@@ -34,9 +48,9 @@ def format_reasoning_lines(result: WorkflowResult, prefix: str = "  ") -> list[s
             f"position_qty={result.performance.position_qty}"
         )
     if result.previous_forecast is not None:
-        lines.append(f"{prefix}Prior Forecast: {_display_reason(result.previous_forecast.summary)}")
+        lines.append(f"{prefix}Prior Forecast: {display_reason(result.previous_forecast.summary)}")
     if result.hold_forecast is not None:
-        lines.append(f"{prefix}New HOLD Forecast: {_display_reason(result.hold_forecast.summary)}")
+        lines.append(f"{prefix}New HOLD Forecast: {display_reason(result.hold_forecast.summary)}")
     if result.execution.protective_order_ids:
         lines.append(f"{prefix}Protective Orders: {result.execution.protective_order_ids}")
     lines.extend(_alpha_vantage_hour_chunk_lines(result, prefix=prefix))
@@ -56,26 +70,32 @@ def format_reasoning_lines(result: WorkflowResult, prefix: str = "  ") -> list[s
     return lines
 
 
-def _display_reason(value: str | None) -> str:
+def display_reason(value: str | None) -> str:
+    """Normalize optional agent output for console display."""
+
     if value is None:
         return "<no output returned>"
     candidate = value.strip()
     return candidate or "<no output returned>"
 
 
-def _artifact_location(artifact) -> str:
+def artifact_location(artifact) -> str:
+    """Return a stable string location for a persisted artifact."""
+
     uri = getattr(artifact, "uri", None)
     if uri:
         return str(uri)
     return str(artifact)
 
 
-def _print_indicator_context(
+def print_indicator_context(
     snapshot: AlphaVantageIndicatorSnapshot | None,
     *,
     indicator_source: str,
     feature_frame: pd.DataFrame,
 ) -> None:
+    """Print the indicator source summary for the current workflow iteration."""
+
     if snapshot is None:
         print(
             f"[Workflow] Feature engineering finished: source={indicator_source} | "
@@ -94,7 +114,9 @@ def _print_indicator_context(
     )
 
 
-def _print_labeled_items(label: str, items: list[str]) -> None:
+def print_labeled_items(label: str, items: list[str]) -> None:
+    """Print numbered workflow messages that share a common label."""
+
     if not items:
         return
     for index, item in enumerate(items, 1):
@@ -139,3 +161,12 @@ def _frame_window(frame: pd.DataFrame) -> str:
         return f"{pd.Timestamp(start).isoformat()} -> {pd.Timestamp(end).isoformat()}"
     except Exception:
         return "<unknown>"
+
+
+# Thin compatibility aliases for callers still importing the old underscored names.
+_print_collected_windows = print_collected_windows
+_print_reasoning = print_reasoning
+_display_reason = display_reason
+_artifact_location = artifact_location
+_print_indicator_context = print_indicator_context
+_print_labeled_items = print_labeled_items

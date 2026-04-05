@@ -66,6 +66,7 @@ class BacktestingEngine:
         max_iterations: int | None = None,
         sleep_seconds: float | None = None,
     ) -> BacktestSummary:
+        """Run the configured workflow or legacy modules as a backtest."""
         if five_minute_bars is not None:
             return self._run_legacy(
                 symbol=symbol,
@@ -173,9 +174,11 @@ class _NullRawStore:
     """Minimal raw-store stub used by the legacy backtesting path."""
 
     def save_bars(self, symbol: str, timeframe: str, bars: pd.DataFrame) -> Path:
+        """Return a placeholder bars path for legacy backtests."""
         return Path("/tmp")
 
     def save_news(self, symbol: str, articles) -> Path:
+        """Return a placeholder news path for legacy backtests."""
         return Path("/tmp")
 
 
@@ -190,6 +193,7 @@ class _BacktestRetrievalModule:
         input_size_chars: int | None = None,
         published_at_lte=None,
     ) -> RetrievalResult:
+        """Return an empty retrieval payload for legacy backtests."""
         return RetrievalResult(
             symbol=symbol,
             articles=[],

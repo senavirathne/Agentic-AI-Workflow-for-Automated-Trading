@@ -166,6 +166,7 @@ class SQLiteResultStore:
         *,
         raw_artifacts: dict[str, StorageRef] | None = None,
     ) -> None:
+        """Persist one workflow run to SQLite."""
         metadata = {
             "analysis_interval": "5min",
             "loop_interval": "1h",
@@ -236,6 +237,7 @@ class SQLiteResultStore:
             )
 
     def save_backtest_summary(self, summary: BacktestSummary) -> None:
+        """Persist one backtest summary to SQLite."""
         with self.engine.begin() as connection:
             connection.execute(
                 sa.insert(self.backtest_runs_table).values(
@@ -254,6 +256,7 @@ class SQLiteResultStore:
             )
 
     def save_last_processed(self, symbol: str, timestamp: pd.Timestamp) -> None:
+        """Persist the last processed checkpoint for ``symbol``."""
         normalized_timestamp = pd.Timestamp(timestamp).isoformat()
         with self.engine.begin() as connection:
             update_result = connection.execute(
@@ -270,6 +273,7 @@ class SQLiteResultStore:
                 )
 
     def load_last_processed(self, symbol: str) -> pd.Timestamp | None:
+        """Load the last processed checkpoint for ``symbol``."""
         with self.engine.begin() as connection:
             row = connection.execute(
                 sa.select(self.workflow_state_table.c.last_processed_at).where(
@@ -281,6 +285,7 @@ class SQLiteResultStore:
         return pd.Timestamp(row[0])
 
     def save_alpha_vantage_indicator_snapshot(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
+        """Persist one Alpha Vantage indicator snapshot."""
         latest_hour_chunk = snapshot.latest_hour_chunk
         with self.engine.begin() as connection:
             existing = connection.execute(
@@ -317,6 +322,7 @@ class SQLiteResultStore:
         trading_day: str | None = None,
         interval: str | None = None,
     ) -> AlphaVantageIndicatorSnapshot | None:
+        """Load one stored Alpha Vantage indicator snapshot."""
         statement = (
             sa.select(self.alpha_vantage_indicator_snapshots_table.c.payload)
             .where(self.alpha_vantage_indicator_snapshots_table.c.symbol == symbol.upper())
@@ -343,6 +349,7 @@ class SQLiteResultStore:
         *,
         interval: str | None = None,
     ) -> list[AlphaVantageIndicatorSnapshot]:
+        """Load all stored Alpha Vantage indicator snapshots for ``symbol``."""
         statement = (
             sa.select(
                 self.alpha_vantage_indicator_snapshots_table.c.trading_day,
@@ -375,6 +382,7 @@ class SQLiteResultStore:
         trading_day: str | None = None,
         interval: str | None = None,
     ):
+        """Load the relevant Alpha Vantage hour chunk for a checkpoint."""
         target_trading_day = trading_day
         if target_trading_day is None and as_of is not None:
             target_trading_day = _normalize_timestamp(as_of).date().isoformat()
@@ -388,6 +396,7 @@ class SQLiteResultStore:
         return _snapshot_hour_chunk(snapshot, as_of=as_of)
 
     def save_forecast_snapshot(self, snapshot) -> None:
+        """Persist a HOLD forecast snapshot."""
         payload = _forecast_payload(snapshot)
         with self.engine.begin() as connection:
             connection.execute(
@@ -408,6 +417,7 @@ class SQLiteResultStore:
         *,
         as_of: pd.Timestamp | None = None,
     ):
+        """Load the latest valid forecast for ``symbol``."""
         statement = (
             sa.select(self.forecast_snapshots_table.c.payload)
             .where(self.forecast_snapshots_table.c.symbol == symbol.upper())
@@ -423,6 +433,7 @@ class SQLiteResultStore:
         return _forecast_from_payload(json.loads(row.payload))
 
     def load_latest_performance(self, symbol: str) -> PerformanceSnapshot | None:
+        """Load the latest persisted performance snapshot for ``symbol``."""
         statement = (
             sa.select(self.workflow_runs_table.c.metadata)
             .where(self.workflow_runs_table.c.symbol == symbol.upper())
@@ -444,6 +455,7 @@ class SQLiteResultStore:
         return None
 
     def count_executed_trades(self, symbol: str) -> int:
+        """Count executed trades stored for ``symbol``."""
         with self.engine.begin() as connection:
             count = connection.execute(
                 sa.select(sa.func.count())
@@ -454,6 +466,7 @@ class SQLiteResultStore:
         return int(count)
 
     def save_retrieved_news(self, symbol: str, query: str, articles: list[NewsArticle]) -> None:
+        """Persist retrieved articles for a symbol/query pair."""
         normalized_symbol = symbol.upper()
         fetched_at = _utc_now_text()
         rows = []
@@ -495,6 +508,7 @@ class SQLiteResultStore:
         provider: str,
         fetch_bucket: str,
     ) -> None:
+        """Record that a provider/query fetch already occurred."""
         row = {
             "symbol": symbol.upper(),
             "query": query,
@@ -516,6 +530,7 @@ class SQLiteResultStore:
         provider: str,
         fetch_bucket: str,
     ) -> bool:
+        """Report whether a provider/query fetch already occurred."""
         statement = (
             sa.select(self.news_query_fetches_table.c.id)
             .where(self.news_query_fetches_table.c.symbol == symbol.upper())
@@ -536,6 +551,7 @@ class SQLiteResultStore:
         limit: int = 100,
         published_at_lte: pd.Timestamp | str | None = None,
     ) -> list[NewsArticle]:
+        """Load cached articles for a symbol/query pair."""
         statement = (
             sa.select(
                 self.retrieved_news_table.c.headline,

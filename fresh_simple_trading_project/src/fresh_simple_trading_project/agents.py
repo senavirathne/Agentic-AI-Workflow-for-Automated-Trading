@@ -68,6 +68,8 @@ class TechnicalAnalysisAgent:
         indicator_source: str = "manually computed indicators from 5-minute bar data",
         previous_forecast: ForecastSnapshot | None = None,
     ) -> str | None:
+        """Generate the technical handoff consumed by later workflow stages."""
+
         if self.llm_client is None:
             return None
 
@@ -146,6 +148,8 @@ class NewsResearchAgent:
         search_queries: list[str],
         limit: int | None = None,
     ) -> NewsResearchSummary | None:
+        """Summarize recent articles into structured trading context."""
+
         if self.llm_client is None or not articles:
             return None
 
@@ -205,6 +209,8 @@ class RiskReviewAgent:
         take_profit_price: float | None = None,
         position_in_profit: bool = False,
     ) -> str | None:
+        """Generate the concise risk handoff used by the decision stage."""
+
         if self.llm_client is None:
             return None
 
@@ -259,6 +265,8 @@ class DecisionCoordinatorAgent:
         risk: RiskResult,
         previous_forecast: ForecastSnapshot | None = None,
     ) -> DecisionReview:
+        """Review the rule-based trade and return the coordinator payload."""
+
         if self.llm_client is None:
             return DecisionReview()
         price_levels = analysis.price_levels
@@ -331,6 +339,8 @@ class HoldForecastAgent:
         previous_forecast: ForecastSnapshot | None = None,
         valid_for_minutes: int = 60,
     ) -> ForecastSnapshot:
+        """Generate the next HOLD forecast snapshot for the active symbol."""
+
         generated_at = _as_utc_timestamp(analysis.timestamp)
         valid_until = generated_at + pd.Timedelta(minutes=max(1, valid_for_minutes))
         latest_price = float(analysis.current_price or analysis.latest_price)

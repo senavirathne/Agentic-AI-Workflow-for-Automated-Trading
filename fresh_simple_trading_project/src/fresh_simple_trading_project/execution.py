@@ -13,6 +13,7 @@ class BrokerClient(Protocol):
     """Protocol for broker clients that can place orders."""
 
     def place_order(self, symbol: str, qty: int, side: str) -> str:
+        """Place an order and return the broker order identifier."""
         ...
 
 
@@ -27,11 +28,13 @@ class InMemoryBrokerClient:
     latest_timestamps: dict[str, str | None] = field(default_factory=dict)
 
     def set_market_price(self, symbol: str, price: float, timestamp: object | None = None) -> None:
+        """Record the latest market price used for simulated fills."""
         normalized_symbol = symbol.upper()
         self.latest_prices[normalized_symbol] = float(price)
         self.latest_timestamps[normalized_symbol] = None if timestamp is None else str(timestamp)
 
     def place_order(self, symbol: str, qty: int, side: str) -> str:
+        """Record a paper order and optionally apply it to the simulated account."""
         normalized_symbol = symbol.upper()
         normalized_side = side.upper()
         order_id = f"paper-{len(self.submitted_orders) + 1}"
@@ -60,6 +63,7 @@ class InMemoryBrokerClient:
         stop_loss_price: float | None,
         take_profit_price: float | None,
     ) -> list[str]:
+        """Replace simulated protective orders for ``symbol``."""
         self.clear_risk_orders(symbol)
         normalized_symbol = symbol.upper()
         order_ids: list[str] = []
@@ -94,6 +98,7 @@ class InMemoryBrokerClient:
         return order_ids
 
     def clear_risk_orders(self, symbol: str) -> None:
+        """Remove simulated protective orders for ``symbol``."""
         normalized_symbol = symbol.upper()
         self.protective_orders = [
             order for order in self.protective_orders if order.get("symbol") != normalized_symbol
@@ -114,6 +119,7 @@ class ExecutionModule:
         account: AccountState | None = None,
         risk: RiskResult | None = None,
     ) -> ExecutionResult:
+        """Execute the decision and synchronize protective orders when needed."""
         primary_order_id: str | None = None
         executed = False
         if decision.action != Action.HOLD and decision.quantity > 0:

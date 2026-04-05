@@ -41,20 +41,25 @@ class InMemoryResultStore:
         *,
         raw_artifacts: dict[str, StorageRef] | None = None,
     ) -> None:
+        """Persist one workflow result in memory."""
         self.workflow_runs.append(result)
         if raw_artifacts:
             self.raw_artifacts_by_symbol[result.symbol] = dict(raw_artifacts)
 
     def save_backtest_summary(self, summary: BacktestSummary) -> None:
+        """Persist one backtest summary in memory."""
         self.backtest_runs.append(summary)
 
     def save_last_processed(self, symbol: str, timestamp: pd.Timestamp) -> None:
+        """Persist the last processed checkpoint for ``symbol``."""
         self.last_processed[symbol] = pd.Timestamp(timestamp)
 
     def load_last_processed(self, symbol: str) -> pd.Timestamp | None:
+        """Load the last processed checkpoint for ``symbol``."""
         return self.last_processed.get(symbol)
 
     def save_alpha_vantage_indicator_snapshot(self, snapshot: AlphaVantageIndicatorSnapshot) -> None:
+        """Persist an Alpha Vantage snapshot in memory."""
         normalized_symbol = snapshot.symbol.upper()
         normalized_interval = snapshot.interval
         normalized_trading_day = snapshot.trading_day
@@ -76,6 +81,7 @@ class InMemoryResultStore:
         trading_day: str | None = None,
         interval: str | None = None,
     ) -> AlphaVantageIndicatorSnapshot | None:
+        """Load one stored Alpha Vantage snapshot."""
         normalized_symbol = symbol.upper()
         candidates = [
             snapshot
@@ -94,6 +100,7 @@ class InMemoryResultStore:
         *,
         interval: str | None = None,
     ) -> list[AlphaVantageIndicatorSnapshot]:
+        """Load all stored Alpha Vantage snapshots for ``symbol``."""
         normalized_symbol = symbol.upper()
         candidates = [
             snapshot
@@ -111,6 +118,7 @@ class InMemoryResultStore:
         trading_day: str | None = None,
         interval: str | None = None,
     ):
+        """Load the relevant Alpha Vantage hour chunk for a checkpoint."""
         target_trading_day = trading_day
         if target_trading_day is None and as_of is not None:
             target_trading_day = _normalize_timestamp(as_of).date().isoformat()
@@ -124,6 +132,7 @@ class InMemoryResultStore:
         return _snapshot_hour_chunk(snapshot, as_of=as_of)
 
     def save_forecast_snapshot(self, snapshot: ForecastSnapshot) -> None:
+        """Persist a forecast snapshot in memory."""
         self.forecast_snapshots.append(snapshot)
 
     def load_latest_forecast(
@@ -132,6 +141,7 @@ class InMemoryResultStore:
         *,
         as_of: pd.Timestamp | None = None,
     ) -> ForecastSnapshot | None:
+        """Load the latest valid forecast for ``symbol``."""
         normalized_symbol = symbol.upper()
         as_of_timestamp = None if as_of is None else _normalize_timestamp(as_of)
         candidates = [
@@ -145,6 +155,7 @@ class InMemoryResultStore:
         return max(candidates, key=lambda snapshot: _normalize_timestamp(snapshot.generated_at))
 
     def load_latest_performance(self, symbol: str) -> PerformanceSnapshot | None:
+        """Load the latest stored performance snapshot for ``symbol``."""
         normalized_symbol = symbol.upper()
         for result in reversed(self.workflow_runs):
             if result.symbol.upper() != normalized_symbol or result.performance is None:
@@ -153,6 +164,7 @@ class InMemoryResultStore:
         return None
 
     def count_executed_trades(self, symbol: str) -> int:
+        """Count executed trades stored for ``symbol``."""
         normalized_symbol = symbol.upper()
         return sum(
             1
@@ -161,6 +173,7 @@ class InMemoryResultStore:
         )
 
     def save_retrieved_news(self, symbol: str, query: str, articles: list[NewsArticle]) -> None:
+        """Persist retrieved articles for a symbol/query pair."""
         normalized_symbol = symbol.upper()
         for article in articles:
             headline = article.headline.strip()
@@ -186,6 +199,7 @@ class InMemoryResultStore:
         provider: str,
         fetch_bucket: str,
     ) -> None:
+        """Record that a provider/query fetch already occurred."""
         self.news_query_fetches.add((symbol.upper(), query, provider.strip().lower(), fetch_bucket))
 
     def has_news_query_fetch(
@@ -196,6 +210,7 @@ class InMemoryResultStore:
         provider: str,
         fetch_bucket: str,
     ) -> bool:
+        """Report whether a provider/query fetch already occurred."""
         return (symbol.upper(), query, provider.strip().lower(), fetch_bucket) in self.news_query_fetches
 
     def load_retrieved_news(
@@ -206,6 +221,7 @@ class InMemoryResultStore:
         limit: int = 100,
         published_at_lte: pd.Timestamp | str | None = None,
     ) -> list[NewsArticle]:
+        """Load cached articles for a symbol/query pair."""
         normalized_symbol = symbol.upper()
         articles = [
             article

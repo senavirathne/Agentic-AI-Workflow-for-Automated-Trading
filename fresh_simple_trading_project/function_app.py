@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import azure.functions as func
 
@@ -177,6 +178,40 @@ def _request_value(req: func.HttpRequest, payload: dict[str, Any], key: str) -> 
     if key in payload:
         return payload[key]
     return req.params.get(key)
+
+
+def _sibling_route_url(req: func.HttpRequest, sibling_name: str, **extra_params: Any) -> str:
+    split = urlsplit(req.url)
+    base_query = dict(parse_qsl(split.query, keep_blank_values=True))
+    if "code" in req.params and "code" not in base_query:
+        base_query["code"] = req.params["code"]
+    base_query.update({key: str(value) for key, value in extra_params.items() if value not in {None, ""}})
+    route_prefix = split.path.rsplit("/", 1)[0]
+    return urlunsplit(
+        (
+            split.scheme,
+            split.netloc,
+            f"{route_prefix}/{sibling_name}",
+            urlencode(base_query),
+            "",
+        )
+    )
+
+
+def _dispatch_with_log_urls(req: func.HttpRequest, dispatch: dict[str, Any]) -> dict[str, Any]:
+    enriched_dispatch = dict(dispatch)
+    log_file_path = enriched_dispatch.get("log_file_path")
+    if not log_file_path:
+        return enriched_dispatch
+
+    enriched_dispatch["log_url"] = _sibling_route_url(req, "log", log_file_path=log_file_path)
+    enriched_dispatch["log_download_url"] = _sibling_route_url(
+        req,
+        "log",
+        log_file_path=log_file_path,
+        download="true",
+    )
+    return enriched_dispatch
 
 
 def _response(*, message: str, dispatch: dict[str, Any], status_code: int = 200) -> func.HttpResponse:
@@ -364,12 +399,17 @@ def _build_run_command_input(script_lines: list[str]):
 
 
 def _build_log_tail_script(*, log_file_path: str, lines: int) -> list[str]:
+    return _build_log_read_script(log_file_path=log_file_path, lines=lines)
+
+
+def _build_log_read_script(*, log_file_path: str, lines: int | None = None) -> list[str]:
     quoted_log_file = shlex.quote(log_file_path)
+    read_command = f"cat {quoted_log_file}" if lines is None else f"tail -n {lines} {quoted_log_file}"
     return [
         "set -euo pipefail",
         f'if [ ! -f {quoted_log_file} ]; then echo "{LOG_OUTPUT_ERROR_MARKER} Log file not found: {log_file_path}"; exit 3; fi',
         f'echo "{LOG_OUTPUT_START_MARKER}"',
-        f"tail -n {lines} {quoted_log_file}",
+        read_command,
         f'echo "{LOG_OUTPUT_END_MARKER}"',
     ]
 
@@ -488,10 +528,25 @@ def _fetch_vm_log_tail(
     log_file_path: str,
     lines: int,
 ) -> str:
+    return _fetch_vm_log(
+        compute_client=compute_client,
+        config=config,
+        log_file_path=log_file_path,
+        lines=lines,
+    )
+
+
+def _fetch_vm_log(
+    *,
+    compute_client: Any,
+    config: VmRunnerConfig,
+    log_file_path: str,
+    lines: int | None = None,
+) -> str:
     result = _run_vm_shell_script_sync(
         compute_client,
         config,
-        _build_log_tail_script(log_file_path=log_file_path, lines=lines),
+        _build_log_read_script(log_file_path=log_file_path, lines=lines),
     )
     raw_output = _extract_run_command_output(result)
     if LOG_OUTPUT_ERROR_MARKER in raw_output:
@@ -657,6 +712,17 @@ def _log_response(
     )
 
 
+def _log_download_response(*, log_file_path: str, content: str) -> func.HttpResponse:
+    return func.HttpResponse(
+        content,
+        status_code=200,
+        mimetype="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="{Path(log_file_path).name}"',
+        },
+    )
+
+
 # The schedule "0 0 * * * *" means:
 # Run at the start (0 seconds, 0 minutes) of every hour.
 @app.timer_trigger(schedule="0 0 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=True)
@@ -698,8 +764,9 @@ def trading_timer_trigger(myTimer: func.TimerRequest) -> None:
     )
 
 
-@app.route(route="trading/vm/start", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="trading/vm/start", methods=["GET", "POST"], auth_level=func.AuthLevel.FUNCTION)
 def start_trading_vm(req: func.HttpRequest) -> func.HttpResponse:
+    """Start a VM-backed trading run and return dispatch details."""
     payload = _request_payload(req)
     config = _load_vm_runner_config()
     default_symbol, default_loops, default_mode = _default_dispatch_values(config)
@@ -740,13 +807,14 @@ def start_trading_vm(req: func.HttpRequest) -> func.HttpResponse:
 
     return _response(
         message="Trading VM dispatch accepted.",
-        dispatch=dispatch,
+        dispatch=_dispatch_with_log_urls(req, dispatch),
         status_code=202,
     )
 
 
 @app.route(route="trading/vm/status", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
 def trading_vm_status(req: func.HttpRequest) -> func.HttpResponse:
+    """Return the latest VM trading dispatch status."""
     del req
     return _response(
         message="Current VM trading dispatch status.",
@@ -756,6 +824,7 @@ def trading_vm_status(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="trading/vm/log", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
 def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
+    """Return the current VM log tail or the full log as a download."""
     state = _load_dispatch_state()
     log_file_path = str(req.params.get("log_file_path") or state.get("log_file_path") or "").strip()
     if not log_file_path:
@@ -766,6 +835,7 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
 
     lines = _parse_log_tail_lines(req.params.get("lines"), default=DEFAULT_LOG_TAIL_LINES)
     start_if_needed = _parse_bool(req.params.get("start_if_needed"), False)
+    download = _parse_bool(req.params.get("download"), False)
 
     try:
         config = _load_vm_runner_config()
@@ -785,11 +855,11 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
             compute_client.virtual_machines.begin_start(config.resource_group, config.vm_name).result()
             power_state = "running"
 
-        content = _fetch_vm_log_tail(
+        content = _fetch_vm_log(
             compute_client=compute_client,
             config=config,
             log_file_path=log_file_path,
-            lines=lines,
+            lines=None if download else lines,
         )
     except VmLogAccessError as exc:
         return _log_response(
@@ -810,6 +880,9 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
         )
 
+    if download:
+        return _log_download_response(log_file_path=log_file_path, content=content)
+
     return _log_response(
         message="Current VM workflow log tail.",
         log_file_path=log_file_path,
@@ -817,3 +890,21 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
         lines=lines,
         content=content,
     )
+
+
+@app.route(route="trading/session/start", methods=["GET", "POST"], auth_level=func.AuthLevel.FUNCTION)
+def start_trading_session(req: func.HttpRequest) -> func.HttpResponse:
+    """Compatibility route for older trading session start callers."""
+    return start_trading_vm(req)
+
+
+@app.route(route="trading/session/status", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def trading_session_status(req: func.HttpRequest) -> func.HttpResponse:
+    """Compatibility route for older trading session status callers."""
+    return trading_vm_status(req)
+
+
+@app.route(route="trading/session/log", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def trading_session_log(req: func.HttpRequest) -> func.HttpResponse:
+    """Compatibility route for older trading session log callers."""
+    return trading_vm_log(req)

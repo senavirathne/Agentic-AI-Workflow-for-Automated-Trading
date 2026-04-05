@@ -123,6 +123,7 @@ def us_market_day_dates(
     *,
     max_date: date | None = None,
 ) -> list[date]:
+    """Return sorted U.S. market dates present in the supplied timestamps."""
     candidate_dates = _available_us_market_dates(timestamps)
     if max_date is None:
         return candidate_dates

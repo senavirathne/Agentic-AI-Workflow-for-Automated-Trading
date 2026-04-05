@@ -15,6 +15,7 @@ class TextGenerationClient(Protocol):
     """Minimal interface for text-generation backends used by agents."""
 
     def generate(self, system_prompt: str, content: str) -> str | None:
+        """Generate text from the supplied system and user prompts."""
         ...
 
 
@@ -152,11 +153,11 @@ class OpenAICompatibleLLMClient:
 
 
 class DeepSeekLLMClient(OpenAICompatibleLLMClient):
-    """DeepSeek client wired through the OpenAI-compatible SDK surface."""
+    """Compatibility subclass for callers that still import ``DeepSeekLLMClient``."""
 
 
 class OpenAILLMClient(OpenAICompatibleLLMClient):
-    """Native OpenAI client using the same streaming chat-completions flow."""
+    """Compatibility subclass for callers that still import ``OpenAILLMClient``."""
 
 
 @dataclass

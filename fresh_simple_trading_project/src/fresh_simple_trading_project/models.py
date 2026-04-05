@@ -95,7 +95,7 @@ class EDAResult:
 
 @dataclass
 class PriceLevelContext:
-    """Support, resistance, and local-region context derived from price history."""
+    """Describe major and local support/resistance context for one analysis step."""
 
     support_levels: list[float] = field(default_factory=list)
     resistance_levels: list[float] = field(default_factory=list)
@@ -115,7 +115,12 @@ class PriceLevelContext:
 
 @dataclass
 class AnalysisResult:
-    """Technical market-analysis output used by downstream stages."""
+    """Represent the technical analysis snapshot consumed by later workflow stages.
+
+    The canonical price-level payload lives on ``price_levels``. Legacy flat
+    constructor kwargs and attribute accessors remain available as a compatibility
+    shim for existing tests and downstream callers.
+    """
 
     symbol: str
     timestamp: pd.Timestamp
@@ -165,68 +170,56 @@ class AnalysisResult:
         distance_to_support_pct: float | None,
         distance_to_resistance_pct: float | None,
     ) -> None:
-        if not any(
-            value is not None
-            for value in (
-                support_levels,
-                resistance_levels,
-                support_regions,
-                resistance_regions,
-                support_region_strengths,
-                resistance_region_strengths,
-                nearest_support,
-                nearest_resistance,
-                nearest_support_region,
-                nearest_resistance_region,
-                nearest_support_region_strength,
-                nearest_resistance_region_strength,
-                distance_to_support_pct,
-                distance_to_resistance_pct,
-            )
-        ):
+        legacy_overrides = {
+            "support_levels": support_levels,
+            "resistance_levels": resistance_levels,
+            "support_regions": support_regions,
+            "resistance_regions": resistance_regions,
+            "support_region_strengths": support_region_strengths,
+            "resistance_region_strengths": resistance_region_strengths,
+            "nearest_support": nearest_support,
+            "nearest_resistance": nearest_resistance,
+            "nearest_support_region": nearest_support_region,
+            "nearest_resistance_region": nearest_resistance_region,
+            "nearest_support_region_strength": nearest_support_region_strength,
+            "nearest_resistance_region_strength": nearest_resistance_region_strength,
+            "distance_to_support_pct": distance_to_support_pct,
+            "distance_to_resistance_pct": distance_to_resistance_pct,
+        }
+        if not _has_price_level_overrides(legacy_overrides):
             return
+        self.price_levels = _merge_price_levels(self.price_levels, legacy_overrides)
 
-        base = self.price_levels
-        self.price_levels = PriceLevelContext(
-            support_levels=list(base.support_levels if support_levels is None else support_levels),
-            resistance_levels=list(base.resistance_levels if resistance_levels is None else resistance_levels),
-            support_regions=list(base.support_regions if support_regions is None else support_regions),
-            resistance_regions=list(base.resistance_regions if resistance_regions is None else resistance_regions),
-            support_region_strengths=list(
-                base.support_region_strengths if support_region_strengths is None else support_region_strengths
-            ),
-            resistance_region_strengths=list(
-                base.resistance_region_strengths
-                if resistance_region_strengths is None
-                else resistance_region_strengths
-            ),
-            nearest_support=base.nearest_support if nearest_support is None else nearest_support,
-            nearest_resistance=base.nearest_resistance if nearest_resistance is None else nearest_resistance,
-            nearest_support_region=(
-                base.nearest_support_region if nearest_support_region is None else nearest_support_region
-            ),
-            nearest_resistance_region=(
-                base.nearest_resistance_region if nearest_resistance_region is None else nearest_resistance_region
-            ),
-            nearest_support_region_strength=(
-                base.nearest_support_region_strength
-                if nearest_support_region_strength is None
-                else nearest_support_region_strength
-            ),
-            nearest_resistance_region_strength=(
-                base.nearest_resistance_region_strength
-                if nearest_resistance_region_strength is None
-                else nearest_resistance_region_strength
-            ),
-            distance_to_support_pct=(
-                base.distance_to_support_pct if distance_to_support_pct is None else distance_to_support_pct
-            ),
-            distance_to_resistance_pct=(
-                base.distance_to_resistance_pct
-                if distance_to_resistance_pct is None
-                else distance_to_resistance_pct
-            ),
-        )
+
+def _has_price_level_overrides(values: dict[str, object | None]) -> bool:
+    """Report whether legacy flat price-level kwargs were supplied."""
+
+    return any(value is not None for value in values.values())
+
+
+def _merge_price_levels(
+    base: PriceLevelContext,
+    overrides: dict[str, object | None],
+) -> PriceLevelContext:
+    """Apply legacy flat ``AnalysisResult`` kwargs onto ``price_levels``."""
+
+    list_fields = {
+        "support_levels",
+        "resistance_levels",
+        "support_regions",
+        "resistance_regions",
+        "support_region_strengths",
+        "resistance_region_strengths",
+    }
+    merged: dict[str, object | None] = {}
+    for field_name in _LEGACY_PRICE_LEVEL_FIELDS:
+        value = overrides.get(field_name)
+        current = getattr(base, field_name)
+        if field_name in list_fields:
+            merged[field_name] = list(current if value is None else value)
+            continue
+        merged[field_name] = current if value is None else value
+    return PriceLevelContext(**merged)
 
 
 def _price_level_property(name: str) -> property:
@@ -239,7 +232,7 @@ def _price_level_property(name: str) -> property:
     return property(getter, setter)
 
 
-for _legacy_price_level_name in (
+_LEGACY_PRICE_LEVEL_FIELDS = (
     "support_levels",
     "resistance_levels",
     "support_regions",
@@ -254,7 +247,10 @@ for _legacy_price_level_name in (
     "nearest_resistance_region_strength",
     "distance_to_support_pct",
     "distance_to_resistance_pct",
-):
+)
+
+
+for _legacy_price_level_name in _LEGACY_PRICE_LEVEL_FIELDS:
     setattr(AnalysisResult, _legacy_price_level_name, _price_level_property(_legacy_price_level_name))
 
 
@@ -345,7 +341,12 @@ class PerformanceSnapshot:
 
 @dataclass
 class WorkflowResult:
-    """Complete output of a single workflow iteration."""
+    """Capture the full output of one workflow iteration.
+
+    ``five_minute_bars`` and ``hourly_bars`` intentionally duplicate the raw bar
+    artifacts persisted through ``raw_artifacts`` so reporting and existing tests can
+    keep reading them directly from the result object.
+    """
 
     symbol: str
     five_minute_bars: pd.DataFrame

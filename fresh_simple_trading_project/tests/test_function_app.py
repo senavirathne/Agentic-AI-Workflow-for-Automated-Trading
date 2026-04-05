@@ -33,10 +33,11 @@ except ModuleNotFoundError:
             return json.loads(self._body.decode("utf-8"))
 
     class HttpResponse:
-        def __init__(self, body="", *, status_code=200, mimetype=None):
+        def __init__(self, body="", *, status_code=200, mimetype=None, headers=None):
             self._body = body.encode("utf-8") if isinstance(body, str) else body
             self.status_code = status_code
             self.mimetype = mimetype
+            self.headers = headers or {}
 
         def get_body(self):
             return self._body
@@ -229,6 +230,40 @@ def test_start_vm_rejects_invalid_loops() -> None:
 
     assert response.status_code == 400
     assert response.get_body().decode("utf-8") == "loops must be a positive integer"
+
+
+def test_start_vm_accepts_get_query_params_and_returns_log_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_compute = FakeComputeClient("deallocated")
+    monkeypatch.setattr(function_app_module, "_build_compute_client", lambda config: fake_compute)
+    monkeypatch.setattr(function_app_module, "_utcnow_iso", lambda: "2026-04-05T09:32:43+00:00")
+
+    req = func.HttpRequest(
+        method="GET",
+        url="http://localhost/api/trading/session/start?code=test-key",
+        headers={},
+        params={"symbol": "AAPL", "loops": "3", "mode": "backtest", "code": "test-key"},
+        route_params={},
+        body=b"",
+    )
+
+    response = function_app_module.start_trading_session(req)
+    payload = json.loads(response.get_body().decode("utf-8"))
+
+    assert response.status_code == 202
+    assert payload["dispatch"]["symbol"] == "AAPL"
+    assert payload["dispatch"]["loops"] == 3
+    assert payload["dispatch"]["mode"] == "backtest"
+    assert payload["dispatch"]["log_url"] == (
+        "http://localhost/api/trading/session/log"
+        "?code=test-key"
+        "&log_file_path=%2Fopt%2Ffresh_simple_trading_project%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
+    )
+    assert payload["dispatch"]["log_download_url"] == (
+        "http://localhost/api/trading/session/log"
+        "?code=test-key"
+        "&log_file_path=%2Fopt%2Ffresh_simple_trading_project%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
+        "&download=true"
+    )
 
 
 def test_start_vm_force_parses_from_json_and_query_params(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -802,3 +837,56 @@ def test_trading_vm_log_can_start_vm_before_reading(monkeypatch: pytest.MonkeyPa
     assert payload["power_state"] == "running"
     assert payload["content"] == "decision line"
     assert fake_compute.virtual_machines.start_calls == [("rg-test", "vm-test")]
+
+
+def test_trading_vm_log_can_download_full_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_compute = FakeComputeClient(
+        "running",
+        run_command_result=FakeRunCommandResult(
+            "\n".join(
+                [
+                    function_app_module.LOG_OUTPUT_START_MARKER,
+                    "decision line",
+                    "risk line",
+                    function_app_module.LOG_OUTPUT_END_MARKER,
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(function_app_module, "_build_compute_client", lambda config: fake_compute)
+    function_app_module._save_dispatch_state(
+        {
+            "accepted": True,
+            "active": True,
+            "symbol": "AAPL",
+            "loops": 1,
+            "mode": "backtest",
+            "live_after_backtest": False,
+            "trigger_source": "http",
+            "submitted_at": "2026-04-05T09:32:43+00:00",
+            "vm_name": "vm-test",
+            "resource_group": "rg-test",
+            "start_requested": False,
+            "power_state": "running",
+            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+        }
+    )
+
+    req = func.HttpRequest(
+        method="GET",
+        url="http://localhost/api/trading/vm/log",
+        headers={},
+        params={"download": "true"},
+        route_params={},
+        body=b"",
+    )
+
+    response = function_app_module.trading_vm_log(req)
+
+    assert response.status_code == 200
+    assert response.mimetype == "text/plain"
+    assert response.headers["Content-Disposition"] == (
+        'attachment; filename="workflow_backtest_aapl_http_20260405T093243Z.log"'
+    )
+    assert response.get_body().decode("utf-8") == "decision line\nrisk line"
