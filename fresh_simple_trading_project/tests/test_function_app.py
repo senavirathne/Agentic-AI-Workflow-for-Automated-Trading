@@ -151,9 +151,19 @@ def vm_function_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "VM_DEFAULT_MODE",
         "VM_TIMER_ENABLED",
         "VM_AUTO_SHUTDOWN",
+        "VM_AUTO_SHUTDOWN_DELAY_SECONDS",
         "VM_LOG_DIR",
+        "VM_LOG_BLOB_CONTAINER",
+        "VM_LOG_BLOB_PREFIX",
+        "VM_LOG_BLOB_ACCOUNT_URL",
+        "VM_LOG_BLOB_CONNECTION_STRING",
+        "VM_LOG_BLOB_SHARE_TTL_HOURS",
         "TRADING_SYMBOL",
         "RUN_MODE",
+        "AZURE_STORAGE_ACCOUNT_URL",
+        "AZURE_STORAGE_CONNECTION_STRING",
+        "AZURE_BLOB_CONTAINER_LOGS",
+        "AzureWebJobsStorage",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -169,6 +179,7 @@ def vm_function_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VM_DEFAULT_MODE", "live")
     monkeypatch.setenv("VM_TIMER_ENABLED", "false")
     monkeypatch.setenv("VM_AUTO_SHUTDOWN", "true")
+    monkeypatch.setenv("VM_AUTO_SHUTDOWN_DELAY_SECONDS", "900")
     monkeypatch.setenv("VM_LOG_DIR", "/opt/fresh_simple_trading_project/logs")
     monkeypatch.setattr(
         function_app_module,
@@ -236,6 +247,13 @@ def test_start_vm_accepts_get_query_params_and_returns_log_urls(monkeypatch: pyt
     fake_compute = FakeComputeClient("deallocated")
     monkeypatch.setattr(function_app_module, "_build_compute_client", lambda config: fake_compute)
     monkeypatch.setattr(function_app_module, "_utcnow_iso", lambda: "2026-04-05T09:32:43+00:00")
+    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_URL", "https://example.blob.core.windows.net")
+    monkeypatch.setenv("VM_LOG_BLOB_CONTAINER", "workflow-logs")
+    monkeypatch.setattr(
+        function_app_module,
+        "_shareable_blob_url",
+        lambda **kwargs: "https://example.blob.core.windows.net/workflow-logs/share.log?sas-token",
+    )
 
     req = func.HttpRequest(
         method="GET",
@@ -257,12 +275,23 @@ def test_start_vm_accepts_get_query_params_and_returns_log_urls(monkeypatch: pyt
         "http://localhost/api/trading/session/log"
         "?code=test-key"
         "&log_file_path=%2Fopt%2Ffresh_simple_trading_project%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
+        "&start_if_needed=true"
+        "&wait_for_running_seconds=90"
     )
     assert payload["dispatch"]["log_download_url"] == (
         "http://localhost/api/trading/session/log"
         "?code=test-key"
         "&log_file_path=%2Fopt%2Ffresh_simple_trading_project%2Flogs%2Fworkflow_backtest_aapl_http_20260405T093243Z.log"
+        "&start_if_needed=true"
+        "&wait_for_running_seconds=90"
         "&download=true"
+    )
+    assert payload["dispatch"]["blob_log_url"] == (
+        "https://example.blob.core.windows.net/workflow-logs/logs/2026/04/05/"
+        "workflow_backtest_aapl_http_20260405T093243Z.log"
+    )
+    assert payload["dispatch"]["blob_log_share_url"] == (
+        "https://example.blob.core.windows.net/workflow-logs/share.log?sas-token"
     )
 
 
@@ -495,6 +524,45 @@ def test_build_workflow_runner_script_includes_log_redirection() -> None:
     assert lines[1] == "mkdir -p /srv/trader/logs"
     assert lines[2] == "exec >> /srv/trader/logs/workflow_live_aapl_http_20260405T093243Z.log 2>&1"
     assert any("--mode live --symbol AAPL" in line for line in lines)
+    assert lines[-2] == "sleep 900"
+    assert lines[-1] == "sudo shutdown -h now"
+
+
+def test_build_workflow_runner_script_uploads_blob_and_delays_shutdown() -> None:
+    config = function_app_module.VmRunnerConfig(
+        subscription_id="sub-id",
+        resource_group="rg-test",
+        vm_name="vm-test",
+        project_dir="/srv/trader",
+        venv_activate="/srv/trader/.venv/bin/activate",
+        default_symbol="AAPL",
+        default_loops=1,
+        default_mode="live",
+        timer_enabled=False,
+        auto_shutdown=True,
+        log_dir="/srv/trader/logs",
+        auto_shutdown_delay_seconds=900,
+        log_blob_container="workflow-logs",
+        log_blob_account_url="https://example.blob.core.windows.net",
+    )
+
+    lines = function_app_module._build_workflow_runner_script(
+        config=config,
+        symbol="AAPL",
+        loops=4,
+        mode="live",
+        live_after_backtest=False,
+        submitted_at="2026-04-05T09:32:43+00:00",
+        log_file_path="/srv/trader/logs/workflow_live_aapl_http_20260405T093243Z.log",
+        blob_log_blob_name="logs/2026/04/05/workflow_live_aapl_http_20260405T093243Z.log",
+    )
+
+    assert any("python -m fresh_simple_trading_project.log_blob_uploader" in line for line in lines)
+    assert any("--container workflow-logs" in line for line in lines)
+    assert any(
+        "--blob-name logs/2026/04/05/workflow_live_aapl_http_20260405T093243Z.log" in line for line in lines
+    )
+    assert lines[-2] == "sleep 900"
     assert lines[-1] == "sudo shutdown -h now"
 
 
@@ -847,6 +915,60 @@ def test_trading_vm_log_can_start_vm_before_reading(monkeypatch: pytest.MonkeyPa
     assert payload["power_state"] == "running"
     assert payload["content"] == "decision line"
     assert fake_compute.virtual_machines.start_calls == [("rg-test", "vm-test")]
+
+
+def test_trading_vm_log_waits_for_vm_to_finish_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_compute = FakeComputeClient(
+        "starting",
+        run_command_result=FakeRunCommandResult(
+            "\n".join(
+                [
+                    function_app_module.LOG_OUTPUT_START_MARKER,
+                    "decision line",
+                    function_app_module.LOG_OUTPUT_END_MARKER,
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(function_app_module, "_build_compute_client", lambda config: fake_compute)
+    states = iter(["starting", "running"])
+    monkeypatch.setattr(function_app_module, "_get_vm_power_state", lambda compute_client, config: next(states))
+    monkeypatch.setattr(function_app_module.time, "sleep", lambda _: None)
+    function_app_module._save_dispatch_state(
+        {
+            "accepted": True,
+            "active": True,
+            "symbol": "AAPL",
+            "loops": 1,
+            "mode": "backtest",
+            "live_after_backtest": False,
+            "trigger_source": "http",
+            "submitted_at": "2026-04-05T09:32:43+00:00",
+            "vm_name": "vm-test",
+            "resource_group": "rg-test",
+            "start_requested": False,
+            "power_state": "starting",
+            "log_file_path": "/opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+            "log_tail_command": "tail -f /opt/fresh_simple_trading_project/logs/workflow_backtest_aapl_http_20260405T093243Z.log",
+        }
+    )
+
+    req = func.HttpRequest(
+        method="GET",
+        url="http://localhost/api/trading/vm/log",
+        headers={},
+        params={"wait_for_running_seconds": "15"},
+        route_params={},
+        body=b"",
+    )
+
+    response = function_app_module.trading_vm_log(req)
+    payload = json.loads(response.get_body().decode("utf-8"))
+
+    assert response.status_code == 200
+    assert payload["power_state"] == "running"
+    assert payload["content"] == "decision line"
+    assert fake_compute.virtual_machines.start_calls == []
 
 
 def test_trading_vm_log_can_download_full_log(monkeypatch: pytest.MonkeyPatch) -> None:

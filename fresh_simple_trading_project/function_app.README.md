@@ -76,6 +76,10 @@ curl \
   "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/start?code=<FUNCTION_KEY>&symbol=AAPL&mode=backtest&loops=3"
 ```
 
+Accepted start responses include `log_url` and `log_download_url`. Those generated URLs already include
+`start_if_needed=true` and `wait_for_running_seconds=90` so they can tolerate the VM still transitioning
+through Azure's `starting` state when opened immediately after dispatch.
+
 Fetch the latest saved log tail from your local terminal:
 
 ```bash
@@ -96,4 +100,11 @@ Download the full log file snapshot:
 curl -L \
   "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/log?code=<FUNCTION_KEY>&log_file_path=<URL_ENCODED_LOG_FILE_PATH>&download=true" \
   -o workflow.log
+```
+
+If you want the endpoint to wait for a booting VM to reach `running`, you can also pass:
+
+```bash
+curl \
+  "https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/vm/log?code=<FUNCTION_KEY>&log_file_path=<URL_ENCODED_LOG_FILE_PATH>&start_if_needed=true&wait_for_running_seconds=90"
 ```

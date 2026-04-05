@@ -3,11 +3,13 @@ import logging
 import os
 import shlex
 import tempfile
+import time
+from datetime import timedelta
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import azure.functions as func
 
@@ -24,9 +26,14 @@ DEFAULT_LOOPS = 1
 DEFAULT_MODE = LIVE_MODE
 DEFAULT_TIMER_ENABLED = False
 DEFAULT_AUTO_SHUTDOWN = True
+DEFAULT_AUTO_SHUTDOWN_DELAY_SECONDS = 900
 DEFAULT_LOG_DIR_NAME = "logs"
+DEFAULT_LOG_BLOB_CONTAINER = "logs"
+DEFAULT_LOG_BLOB_SHARE_TTL_HOURS = 168
 DEFAULT_LOG_TAIL_LINES = 80
 MAX_LOG_TAIL_LINES = 200
+DEFAULT_LOG_WAIT_FOR_RUNNING_SECONDS = 90
+VM_POWER_STATE_POLL_SECONDS = 5
 LOG_OUTPUT_START_MARKER = "__CODEX_VM_LOG_START__"
 LOG_OUTPUT_END_MARKER = "__CODEX_VM_LOG_END__"
 LOG_OUTPUT_ERROR_MARKER = "__CODEX_VM_LOG_ERROR__"
@@ -63,6 +70,12 @@ class VmRunnerConfig:
     auto_shutdown: bool
     log_dir: str
     managed_identity_client_id: str | None = None
+    auto_shutdown_delay_seconds: int = DEFAULT_AUTO_SHUTDOWN_DELAY_SECONDS
+    log_blob_container: str | None = None
+    log_blob_prefix: str = ""
+    log_blob_account_url: str | None = None
+    log_blob_connection_string: str | None = None
+    log_blob_share_ttl_hours: int = DEFAULT_LOG_BLOB_SHARE_TTL_HOURS
 
 
 def _utcnow_iso() -> str:
@@ -109,6 +122,8 @@ def _empty_dispatch_state() -> dict[str, Any]:
         "power_state": None,
         "log_file_path": None,
         "log_tail_command": None,
+        "blob_log_url": None,
+        "blob_log_share_url": None,
     }
 
 
@@ -166,6 +181,45 @@ def _parse_log_tail_lines(value: Any, *, default: int = DEFAULT_LOG_TAIL_LINES) 
     return min(parsed, MAX_LOG_TAIL_LINES)
 
 
+def _parse_non_negative_int(value: Any, *, default: int) -> int:
+    if value in {None, ""}:
+        return default
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("wait_for_running_seconds must be a non-negative integer")
+    return parsed
+
+
+def _connection_string_parts(connection_string: str | None) -> dict[str, str]:
+    if not connection_string:
+        return {}
+    parts: dict[str, str] = {}
+    for section in connection_string.split(";"):
+        if "=" not in section:
+            continue
+        key, value = section.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            parts[key] = value
+    return parts
+
+
+def _storage_account_url_from_connection_string(connection_string: str | None) -> str | None:
+    parts = _connection_string_parts(connection_string)
+    if parts.get("BlobEndpoint"):
+        return parts["BlobEndpoint"].rstrip("/")
+    if parts.get("AccountName"):
+        endpoint_suffix = parts.get("EndpointSuffix", "core.windows.net")
+        protocol = parts.get("DefaultEndpointsProtocol", "https")
+        return f"{protocol}://{parts['AccountName']}.blob.{endpoint_suffix}".rstrip("/")
+    return None
+
+
+def _blob_upload_enabled(config: VmRunnerConfig) -> bool:
+    return bool(config.log_blob_container and (config.log_blob_account_url or config.log_blob_connection_string))
+
+
 def _request_payload(req: func.HttpRequest) -> dict[str, Any]:
     try:
         payload = req.get_json()
@@ -204,14 +258,133 @@ def _dispatch_with_log_urls(req: func.HttpRequest, dispatch: dict[str, Any]) -> 
     if not log_file_path:
         return enriched_dispatch
 
-    enriched_dispatch["log_url"] = _sibling_route_url(req, "log", log_file_path=log_file_path)
+    enriched_dispatch["log_url"] = _sibling_route_url(
+        req,
+        "log",
+        log_file_path=log_file_path,
+        start_if_needed="true",
+        wait_for_running_seconds=DEFAULT_LOG_WAIT_FOR_RUNNING_SECONDS,
+    )
     enriched_dispatch["log_download_url"] = _sibling_route_url(
         req,
         "log",
         log_file_path=log_file_path,
+        start_if_needed="true",
+        wait_for_running_seconds=DEFAULT_LOG_WAIT_FOR_RUNNING_SECONDS,
         download="true",
     )
     return enriched_dispatch
+
+
+def _log_blob_name(*, config: VmRunnerConfig, log_file_path: str, submitted_at: str) -> str | None:
+    if not _blob_upload_enabled(config):
+        return None
+    timestamp = datetime.fromisoformat(submitted_at).astimezone(timezone.utc)
+    parts: list[str] = []
+    if config.log_blob_prefix:
+        parts.append(config.log_blob_prefix)
+    parts.extend(
+        [
+            "logs",
+            timestamp.strftime("%Y"),
+            timestamp.strftime("%m"),
+            timestamp.strftime("%d"),
+            Path(log_file_path).name,
+        ]
+    )
+    return "/".join(parts)
+
+
+def _direct_blob_url(*, config: VmRunnerConfig, blob_name: str | None) -> str | None:
+    if not blob_name or not config.log_blob_container:
+        return None
+    base_url = config.log_blob_account_url or _storage_account_url_from_connection_string(config.log_blob_connection_string)
+    if not base_url:
+        return None
+    return f"{base_url.rstrip('/')}/{config.log_blob_container}/{quote(blob_name, safe='/')}"
+
+
+def _build_blob_service_client(config: VmRunnerConfig):
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.blob import BlobServiceClient
+
+    if config.log_blob_connection_string:
+        return BlobServiceClient.from_connection_string(config.log_blob_connection_string)
+    if not config.log_blob_account_url:
+        raise RuntimeError("Missing blob account URL for log uploads.")
+    credential = DefaultAzureCredential(
+        managed_identity_client_id=config.managed_identity_client_id,
+        exclude_interactive_browser_credential=True,
+    )
+    return BlobServiceClient(account_url=config.log_blob_account_url, credential=credential)
+
+
+def _shareable_blob_url(*, config: VmRunnerConfig, blob_name: str | None) -> str | None:
+    if not blob_name or not config.log_blob_container:
+        return None
+
+    direct_url = _direct_blob_url(config=config, blob_name=blob_name)
+    if direct_url is None:
+        return None
+
+    try:
+        from azure.storage.blob import BlobSasPermissions, generate_blob_sas
+    except ModuleNotFoundError:
+        return None
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=5)
+    expiry = now + timedelta(hours=config.log_blob_share_ttl_hours)
+
+    try:
+        if config.log_blob_connection_string:
+            parts = _connection_string_parts(config.log_blob_connection_string)
+            account_name = parts.get("AccountName")
+            account_key = parts.get("AccountKey")
+            if account_name and account_key:
+                token = generate_blob_sas(
+                    account_name=account_name,
+                    container_name=config.log_blob_container,
+                    blob_name=blob_name,
+                    account_key=account_key,
+                    permission=BlobSasPermissions(read=True),
+                    start=start,
+                    expiry=expiry,
+                )
+                return f"{direct_url}?{token}"
+
+        service_client = _build_blob_service_client(config)
+        account_name = getattr(service_client, "account_name", None)
+        if not account_name:
+            return None
+        delegation_key = service_client.get_user_delegation_key(start, expiry)
+        token = generate_blob_sas(
+            account_name=account_name,
+            container_name=config.log_blob_container,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
+            start=start,
+            expiry=expiry,
+        )
+        return f"{direct_url}?{token}"
+    except Exception as exc:  # pragma: no cover - exercised with Azure SDK.
+        logging.warning("Could not generate shareable blob log URL: %s", exc)
+        return None
+
+
+def _build_blob_log_metadata(
+    *,
+    config: VmRunnerConfig,
+    log_file_path: str,
+    submitted_at: str,
+) -> dict[str, str | None]:
+    blob_name = _log_blob_name(config=config, log_file_path=log_file_path, submitted_at=submitted_at)
+    return {
+        "blob_log_blob_name": blob_name,
+        "blob_log_url": _direct_blob_url(config=config, blob_name=blob_name),
+        "blob_log_share_url": _shareable_blob_url(config=config, blob_name=blob_name),
+    }
 
 
 def _response(*, message: str, dispatch: dict[str, Any], status_code: int = 200) -> func.HttpResponse:
@@ -237,6 +410,9 @@ def _require_env(name: str) -> str:
 
 def _load_vm_runner_config() -> VmRunnerConfig:
     project_dir = _require_env("VM_PROJECT_DIR")
+    log_blob_connection_string = os.environ.get("VM_LOG_BLOB_CONNECTION_STRING") or os.environ.get(
+        "AZURE_STORAGE_CONNECTION_STRING"
+    ) or os.environ.get("AzureWebJobsStorage")
     return VmRunnerConfig(
         subscription_id=_require_env("AZURE_SUBSCRIPTION_ID"),
         resource_group=_require_env("AZURE_VM_RESOURCE_GROUP"),
@@ -250,6 +426,30 @@ def _load_vm_runner_config() -> VmRunnerConfig:
         auto_shutdown=_parse_bool(os.environ.get("VM_AUTO_SHUTDOWN"), DEFAULT_AUTO_SHUTDOWN),
         log_dir=os.environ.get("VM_LOG_DIR", str(Path(project_dir) / DEFAULT_LOG_DIR_NAME)),
         managed_identity_client_id=os.environ.get("AZURE_CLIENT_ID"),
+        auto_shutdown_delay_seconds=_parse_non_negative_int(
+            os.environ.get("VM_AUTO_SHUTDOWN_DELAY_SECONDS"),
+            default=DEFAULT_AUTO_SHUTDOWN_DELAY_SECONDS,
+        ),
+        log_blob_container=(
+            os.environ.get("VM_LOG_BLOB_CONTAINER")
+            or os.environ.get("AZURE_BLOB_CONTAINER_LOGS")
+            or DEFAULT_LOG_BLOB_CONTAINER
+        ).strip(),
+        log_blob_prefix=(
+            os.environ.get("VM_LOG_BLOB_PREFIX")
+            or os.environ.get("AZURE_BLOB_PREFIX")
+            or ""
+        ).strip("/"),
+        log_blob_account_url=(
+            os.environ.get("VM_LOG_BLOB_ACCOUNT_URL")
+            or os.environ.get("AZURE_STORAGE_ACCOUNT_URL")
+            or _storage_account_url_from_connection_string(log_blob_connection_string)
+        ),
+        log_blob_connection_string=log_blob_connection_string,
+        log_blob_share_ttl_hours=_parse_non_negative_int(
+            os.environ.get("VM_LOG_BLOB_SHARE_TTL_HOURS"),
+            default=DEFAULT_LOG_BLOB_SHARE_TTL_HOURS,
+        ),
     )
 
 
@@ -312,6 +512,7 @@ def _build_run_command_script(
     live_after_backtest: bool,
     submitted_at: str,
     log_file_path: str,
+    blob_log_blob_name: str | None = None,
 ) -> list[str]:
     runner_script = "\n".join(
         _build_workflow_runner_script(
@@ -322,6 +523,7 @@ def _build_run_command_script(
             live_after_backtest=live_after_backtest,
             submitted_at=submitted_at,
             log_file_path=log_file_path,
+            blob_log_blob_name=blob_log_blob_name,
         )
     )
     quoted_runner_script = shlex.quote(runner_script)
@@ -351,6 +553,7 @@ def _build_workflow_runner_script(
     live_after_backtest: bool,
     submitted_at: str,
     log_file_path: str,
+    blob_log_blob_name: str | None = None,
 ) -> list[str]:
     project_dir = shlex.quote(config.project_dir)
     venv_activate = shlex.quote(config.venv_activate)
@@ -358,6 +561,8 @@ def _build_workflow_runner_script(
     quoted_mode = shlex.quote(mode)
     quoted_log_dir = shlex.quote(str(Path(log_file_path).parent))
     quoted_log_file = shlex.quote(log_file_path)
+    quoted_log_blob_name = shlex.quote(blob_log_blob_name) if blob_log_blob_name else None
+    quoted_log_blob_container = shlex.quote(config.log_blob_container) if config.log_blob_container else None
     primary_run_command = (
         "python -m fresh_simple_trading_project.cli run "
         f"--mode {quoted_mode} --symbol {quoted_symbol}"
@@ -386,8 +591,30 @@ def _build_workflow_runner_script(
             "python -m fresh_simple_trading_project.cli run "
             f"--mode {LIVE_MODE} --symbol {quoted_symbol}"
         )
+    if quoted_log_blob_name and quoted_log_blob_container:
+        lines.extend(
+            [
+                'echo "[Dispatcher] Uploading workflow log to Azure Blob Storage."',
+                (
+                    "if python -m fresh_simple_trading_project.log_blob_uploader "
+                    f"--file {quoted_log_file} "
+                    f"--container {quoted_log_blob_container} "
+                    f"--blob-name {quoted_log_blob_name}; then"
+                ),
+                '  echo "[Dispatcher] Workflow log uploaded to Azure Blob Storage."',
+                "else",
+                '  echo "[Dispatcher] Workflow log upload failed."',
+                "fi",
+            ]
+        )
     if config.auto_shutdown:
-        lines.append('echo "[Dispatcher] Auto shutdown requested."')
+        if config.auto_shutdown_delay_seconds > 0:
+            lines.append(
+                f'echo "[Dispatcher] Auto shutdown requested. Sleeping {config.auto_shutdown_delay_seconds} seconds first."'
+            )
+            lines.append(f"sleep {config.auto_shutdown_delay_seconds}")
+        else:
+            lines.append('echo "[Dispatcher] Auto shutdown requested."')
         lines.append("sudo shutdown -h now")
     return lines
 
@@ -493,6 +720,7 @@ def _confirm_vm_runner_launch(
     live_after_backtest: bool,
     submitted_at: str,
     log_file_path: str,
+    blob_log_blob_name: str | None = None,
 ) -> None:
     result = _run_vm_shell_script_sync(
         compute_client,
@@ -505,6 +733,7 @@ def _confirm_vm_runner_launch(
             live_after_backtest=live_after_backtest,
             submitted_at=submitted_at,
             log_file_path=log_file_path,
+            blob_log_blob_name=blob_log_blob_name,
         ),
     )
     raw_output = _extract_run_command_output(result)
@@ -570,6 +799,8 @@ def _record_dispatch(
     power_state: str | None,
     submitted_at: str,
     log_file_path: str,
+    blob_log_url: str | None = None,
+    blob_log_share_url: str | None = None,
 ) -> dict[str, Any]:
     state = {
         "accepted": True,
@@ -586,6 +817,8 @@ def _record_dispatch(
         "power_state": power_state,
         "log_file_path": log_file_path,
         "log_tail_command": f"tail -f {shlex.quote(log_file_path)}",
+        "blob_log_url": blob_log_url,
+        "blob_log_share_url": blob_log_share_url,
     }
     _save_dispatch_state(state)
     return state
@@ -630,6 +863,11 @@ def launch_vm_run(
         trigger_source=trigger_source,
         submitted_at=submitted_at,
     )
+    blob_log_metadata = _build_blob_log_metadata(
+        config=config,
+        log_file_path=log_file_path,
+        submitted_at=submitted_at,
+    )
 
     logging.info(
         "Dispatching VM run command for %s with symbol=%s loops=%s mode=%s via %s trigger. log_file_path=%s",
@@ -649,6 +887,7 @@ def launch_vm_run(
         live_after_backtest=live_after_backtest,
         submitted_at=submitted_at,
         log_file_path=log_file_path,
+        blob_log_blob_name=blob_log_metadata.get("blob_log_blob_name"),
     )
     return _record_dispatch(
         config=config,
@@ -661,6 +900,8 @@ def launch_vm_run(
         power_state=power_state,
         submitted_at=submitted_at,
         log_file_path=log_file_path,
+        blob_log_url=blob_log_metadata.get("blob_log_url"),
+        blob_log_share_url=blob_log_metadata.get("blob_log_share_url"),
     )
 
 
@@ -694,6 +935,8 @@ def _log_response(
     power_state: str | None,
     lines: int,
     content: str | None,
+    blob_log_url: str | None = None,
+    blob_log_share_url: str | None = None,
     status_code: int = 200,
 ) -> func.HttpResponse:
     return func.HttpResponse(
@@ -704,6 +947,8 @@ def _log_response(
                 "power_state": power_state,
                 "lines": lines,
                 "content": content,
+                "blob_log_url": blob_log_url,
+                "blob_log_share_url": blob_log_share_url,
             },
             indent=2,
         ),
@@ -721,6 +966,20 @@ def _log_download_response(*, log_file_path: str, content: str) -> func.HttpResp
             "Content-Disposition": f'attachment; filename="{Path(log_file_path).name}"',
         },
     )
+
+
+def _wait_for_vm_running(
+    *,
+    compute_client: Any,
+    config: VmRunnerConfig,
+    timeout_seconds: int,
+) -> str | None:
+    deadline = time.monotonic() + timeout_seconds
+    power_state = _get_vm_power_state(compute_client, config)
+    while power_state == "starting" and time.monotonic() < deadline:
+        time.sleep(VM_POWER_STATE_POLL_SECONDS)
+        power_state = _get_vm_power_state(compute_client, config)
+    return power_state
 
 
 # The schedule "0 0 * * * *" means:
@@ -795,13 +1054,13 @@ def start_trading_vm(req: func.HttpRequest) -> func.HttpResponse:
     except DispatchConflictError as exc:
         return _response(
             message=f"A VM trading dispatch is already active. Use force=true to replace it. {exc}",
-            dispatch=_build_status_payload(),
+            dispatch=_dispatch_with_log_urls(req, _build_status_payload()),
             status_code=409,
         )
     except VmDispatchLaunchError as exc:
         return _response(
             message=f"Trading VM dispatch failed before the workflow runner started. {exc}",
-            dispatch=_build_status_payload(),
+            dispatch=_dispatch_with_log_urls(req, _build_status_payload()),
             status_code=500,
         )
 
@@ -815,10 +1074,9 @@ def start_trading_vm(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="trading/vm/status", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
 def trading_vm_status(req: func.HttpRequest) -> func.HttpResponse:
     """Return the latest VM trading dispatch status."""
-    del req
     return _response(
         message="Current VM trading dispatch status.",
-        dispatch=_build_status_payload(),
+        dispatch=_dispatch_with_log_urls(req, _build_status_payload()),
     )
 
 
@@ -836,24 +1094,57 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
     lines = _parse_log_tail_lines(req.params.get("lines"), default=DEFAULT_LOG_TAIL_LINES)
     start_if_needed = _parse_bool(req.params.get("start_if_needed"), False)
     download = _parse_bool(req.params.get("download"), False)
+    try:
+        wait_for_running_seconds = _parse_non_negative_int(
+            req.params.get("wait_for_running_seconds"),
+            default=0,
+        )
+    except ValueError as exc:
+        return func.HttpResponse(str(exc), status_code=400)
 
     try:
         config = _load_vm_runner_config()
         compute_client = _build_compute_client(config)
         power_state = _get_vm_power_state(compute_client, config)
 
+        if power_state == "starting" and wait_for_running_seconds > 0:
+            power_state = _wait_for_vm_running(
+                compute_client=compute_client,
+                config=config,
+                timeout_seconds=wait_for_running_seconds,
+            )
+
         if power_state != "running":
-            if not start_if_needed:
+            if power_state in {"stopped", "stopped(deallocated)", "deallocated"} and start_if_needed:
+                compute_client.virtual_machines.begin_start(config.resource_group, config.vm_name).result()
+                power_state = _wait_for_vm_running(
+                    compute_client=compute_client,
+                    config=config,
+                    timeout_seconds=max(wait_for_running_seconds, DEFAULT_LOG_WAIT_FOR_RUNNING_SECONDS),
+                )
+            elif not start_if_needed:
                 return _log_response(
                     message="VM is not running. Set start_if_needed=true to start the VM before reading logs.",
                     log_file_path=log_file_path,
                     power_state=power_state,
                     lines=lines,
                     content=None,
+                    blob_log_url=state.get("blob_log_url"),
+                    blob_log_share_url=state.get("blob_log_share_url"),
                     status_code=409,
                 )
-            compute_client.virtual_machines.begin_start(config.resource_group, config.vm_name).result()
-            power_state = "running"
+
+        if power_state != "running":
+            return _log_response(
+                message="VM is still not ready for log access. Wait and retry.",
+                log_file_path=log_file_path,
+                power_state=power_state,
+                lines=lines,
+                content=None,
+                blob_log_url=state.get("blob_log_url"),
+                blob_log_share_url=state.get("blob_log_share_url"),
+                status_code=409,
+            )
 
         content = _fetch_vm_log(
             compute_client=compute_client,
@@ -868,6 +1159,8 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
             power_state="running",
             lines=lines,
             content=None,
+            blob_log_url=state.get("blob_log_url"),
+            blob_log_share_url=state.get("blob_log_share_url"),
             status_code=404,
         )
     except Exception as exc:
@@ -877,6 +1170,8 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
             power_state=None,
             lines=lines,
             content=None,
+            blob_log_url=state.get("blob_log_url"),
+            blob_log_share_url=state.get("blob_log_share_url"),
             status_code=500,
         )
 
@@ -889,6 +1184,8 @@ def trading_vm_log(req: func.HttpRequest) -> func.HttpResponse:
         power_state=power_state,
         lines=lines,
         content=content,
+        blob_log_url=state.get("blob_log_url"),
+        blob_log_share_url=state.get("blob_log_share_url"),
     )
 
 

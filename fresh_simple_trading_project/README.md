@@ -154,6 +154,55 @@ The repository includes a standalone Azure Function App entrypoint (`function_ap
 3. Executes the trading CLI on that VM via Azure VM Run Command.
 4. Exposes status and log endpoints for the run.
 
+The start response includes `log_url` and `log_download_url`. Those URLs are generated with
+`start_if_needed=true` and `wait_for_running_seconds=90` so opening them right after dispatch is less
+likely to fail while the VM is still transitioning to `running`.
+
+### Browser-friendly GET routes
+
+The Function App exposes these HTTP routes:
+
+- `GET|POST /api/trading/vm/start`
+- `GET /api/trading/vm/status`
+- `GET /api/trading/vm/log`
+- Compatibility aliases: `/api/trading/session/start`, `/api/trading/session/status`, `/api/trading/session/log`
+
+Use `?code=<FUNCTION_KEY>` in the URL when opening these routes in a browser.
+
+**Trigger a backtest run with GET:**
+
+```text
+https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/start?code=<FUNCTION_KEY>&symbol=AAPL&mode=backtest&loops=1
+```
+
+**Check current status:**
+
+```text
+https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/status?code=<FUNCTION_KEY>
+```
+
+**Read the latest log tail:**
+
+```text
+https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/log?code=<FUNCTION_KEY>
+```
+
+**Download a specific VM log file:**
+
+```text
+https://<FUNCTION_APP_NAME>.azurewebsites.net/api/trading/session/log?code=<FUNCTION_KEY>&log_file_path=<URL_ENCODED_LOG_FILE_PATH>&download=true
+```
+
+If the VM is still booting or already stopped, the generated `log_url` and `log_download_url` include
+`start_if_needed=true` and `wait_for_running_seconds=90` so they can wait for the VM to become ready.
+
+The start/status payload may also include these Blob Storage fallback fields:
+
+- `blob_log_url`: direct blob path for the uploaded log file
+- `blob_log_share_url`: shareable blob URL to send to other people
+
+Use `blob_log_share_url` if direct VM log access is unavailable and the log has already been uploaded to Blob Storage.
+
 **Build Deployment Bundle:**
 ```bash
 ./scripts/build_function_app_package.sh
@@ -196,4 +245,3 @@ python -m pytest tests/test_cli.py tests/test_config.py
 | `FUNCTION_APP_STORAGE_ROOT`| Override runtime storage root | (unset) |
 
 *Azure-specific variables (`AZURE_SUBSCRIPTION_ID`, `AZURE_VM_RESOURCE_GROUP`, `AZURE_VM_NAME`) are only needed for the Function App VM dispatcher.*
-
