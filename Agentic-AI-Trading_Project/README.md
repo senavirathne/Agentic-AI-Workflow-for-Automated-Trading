@@ -33,7 +33,7 @@ graph TD
 
 **Runtime Behaviors:**
 - **Live Mode**: Requires Alpaca credentials. Uses real-time Alpaca market, account, and order APIs.
-- **Backtest Mode**: Replays hourly checkpoints from historical Alpaca OHLCV bars using a simulated account.
+- **Backtest Mode**: Replays hourly checkpoints from historical Alpaca OHLCV bars using a simulated account. This still requires Alpaca credentials for historical bar retrieval.
 - **LLM Integration**: At least one LLM key is required. DeepSeek is the primary client; OpenAI acts as a fallback.
 - **Alpha Vantage**: Generates indicator snapshots and enriches data with news (when configured).
 
@@ -50,10 +50,9 @@ graph TD
   - Alpha Vantage (Optional but recommended)
 
 ### 1. Install Package
-Create a virtual environment and install the package in editable mode:
+From the repository root, create a virtual environment and install the package in editable mode:
 
 ```bash
-cd fresh_simple_trading_project
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -122,6 +121,8 @@ After installation, the `fresh-trader` CLI becomes available.
 
 *Note: The live loop processes completed hourly checkpoints and automatically stops when the live market closes. Backtesting summaries will be persisted automatically after the loop finishes.*
 
+Backtest note: the CLI backtest path still fetches historical OHLCV replay bars from Alpaca, so configure `ALPACA_PAPER_API_KEY` and `ALPACA_PAPER_SECRET_KEY` before using `--mode backtest`.
+
 ### Utilities
 Fetch Alpha Vantage indicator snapshots:
 ```bash
@@ -135,7 +136,7 @@ fresh-trader alpha-vantage-indicators --symbol AAPL
 By default, runtime outputs are written locally:
 - `data/raw/` - Raw bars and news artifacts
 - `data/workflow.sqlite` - SQLite result store
-- `reports/` - Generated report outputs
+- `reports/` - Optional report outputs and project write-ups; the trading workflow does not populate this directory by default
 
 ### Cloud Storage (Azure)
 You can configure the workflow to use Azure for persistence by setting the following in your `.env`:
@@ -234,7 +235,8 @@ python -m pytest tests/test_cli.py tests/test_config.py
 | `RUN_MODE` | Workflow mode (`live` / `backtest`) | `live` |
 | `LIVE_SLEEP_SECONDS` | Delay between live loop iterations | `3600` |
 | `BACKTEST_SLEEP_SECONDS` | Delay between backtest replays | `1` |
-| `LIVE_MARKET_DATA_PROVIDER`| Live market data provider | `alpaca` (auto) |
+| `LIVE_MARKET_DATA_PROVIDER` | Override the live-mode market data provider | Auto: `alpaca` when Alpaca credentials are configured, otherwise `alpha_vantage` |
+| `MARKET_DATA_PROVIDER` | Legacy/general provider override used when `LIVE_MARKET_DATA_PROVIDER` is unset; backtest mode defaults to `alpha_vantage` | (unset) |
 | `RAW_STORE_PROVIDER` | Raw artifact storage backend | `local` |
 | `RESULT_STORE_PROVIDER` | Result storage backend | `sqlite` |
 | `DATABASE_URL` | SQLAlchemy URL for result storage | (local SQLite path) |
